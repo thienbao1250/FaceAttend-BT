@@ -8,9 +8,8 @@ opencv-python==5.0.0.93
 # --- Numerical ---
 numpy==2.5.4
 
-# --- AI Runtime (cài sau khi xác nhận pipeline CPU hoạt động) ---
-# onnxruntime==1.x.x          # CPU
-# onnxruntime-gpu==1.x.x      # GPU — xác minh tương thích CUDA trước
+# --- AI Runtime ---
+onnxruntime==1.21.1          # CPU inference (đã xác nhận)
 
 # --- Backend (Giai đoạn 10) ---
 # fastapi

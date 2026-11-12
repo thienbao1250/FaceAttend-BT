@@ -595,4 +595,8 @@ Gửi cấu trúc thư mục và nội dung các file có sẵn. Từ đó mới
 |---|---|---|---|
 | 2026-11-12 | Môi trường Python | Đã khởi tạo và kích hoạt `.venv` theo trao đổi | Cần xác nhận thông tin package hiện tại trong repository |
 | 2026-11-12 | Camera Capture | Đã chạy test webcam thành công | Cần kiểm tra source để biết code test đang nằm ở đâu |
+| 2026-11-13 | Giai đoạn 2 — Preprocessing | Hoàn thành `preprocessing.py`: letterbox, normalize, NCHW tensor | Tương thích SCRFD + ArcFace |
+| 2026-11-13 | Giai đoạn 3 — Face Detection | Hoàn thành `face_detector.py`: SCRFD ONNX, NMS, landmarks | `det_10g.onnx`; script `run_face_detection.py` |
+| 2026-11-13 | Giai đoạn 4 — Alignment + Quality | Hoàn thành `face_alignment.py` + `face_quality.py` | 47 unit tests passed; script `run_face_alignment.py` |
+| 2026-11-13 | Giai đoạn 5 — Face Embedding (ArcFace) | Hoàn thành `face_recognizer.py`; 42 unit tests passed | `w600k_r50.onnx`; embedding (512,) L2-norm; script `run_face_embedding.py` |
 
