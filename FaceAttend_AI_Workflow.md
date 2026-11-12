@@ -516,7 +516,7 @@ Không commit `.venv/`, file `.env` thật, ảnh khuôn mặt thật, embedding
 | 4 | Căn chỉnh và kiểm tra chất lượng mặt | Chưa thực hiện |
 | 5 | ArcFace tạo embedding | Chưa thực hiện |
 | 6 | So khớp danh tính và unknown/uncertain | Chưa thực hiện |
-| 7 | Đăng ký nhân viên | Chưa thực hiện |
+| 7 | Đăng ký nhân viên | ✅ Hoàn thành |
 | 8 | Quy tắc chấm công | Chưa thực hiện |
 | 9 | Database | Chưa thực hiện |
 | 10 | FastAPI | Chưa thực hiện |
@@ -599,4 +599,6 @@ Gửi cấu trúc thư mục và nội dung các file có sẵn. Từ đó mới
 | 2026-11-13 | Giai đoạn 3 — Face Detection | Hoàn thành `face_detector.py`: SCRFD ONNX, NMS, landmarks | `det_10g.onnx`; script `run_face_detection.py` |
 | 2026-11-13 | Giai đoạn 4 — Alignment + Quality | Hoàn thành `face_alignment.py` + `face_quality.py` | 47 unit tests passed; script `run_face_alignment.py` |
 | 2026-11-13 | Giai đoạn 5 — Face Embedding (ArcFace) | Hoàn thành `face_recognizer.py`; 42 unit tests passed | `w600k_r50.onnx`; embedding (512,) L2-norm; script `run_face_embedding.py` |
+| 2026-11-13 | Giai đoạn 6 — Face Matching | Hoàn thành `face_matcher.py`: FaceGallery + FaceMatcher + evaluate (FAR/FRR) | 3 trạng thái KNOWN/UNKNOWN/UNCERTAIN; script `run_face_matching.py` |
+| 2026-11-13 | Giai đoạn 7 — Employee Enrollment | Hoàn thành `enrollment_service.py`; 40 unit tests passed | Luồng: create_profile → add_sample → finalize; set_status/delete; script `run_enrollment.py` |
 
