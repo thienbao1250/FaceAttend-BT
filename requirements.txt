@@ -1,0 +1,24 @@
+# FaceAttend-BT — Python dependencies
+# Python 3.12+
+# Cài đặt: pip install -r requirements.txt
+
+# --- Computer Vision ---
+opencv-python==5.0.0.93
+
+# --- Numerical ---
+numpy==2.5.4
+
+# --- AI Runtime (cài sau khi xác nhận pipeline CPU hoạt động) ---
+# onnxruntime==1.x.x          # CPU
+# onnxruntime-gpu==1.x.x      # GPU — xác minh tương thích CUDA trước
+
+# --- Backend (Giai đoạn 10) ---
+# fastapi
+# uvicorn[standard]
+# sqlalchemy
+# alembic
+# psycopg2-binary
+
+# --- Testing ---
+pytest==9.2.0
+
