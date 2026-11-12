@@ -49,8 +49,8 @@ requirements.txt
 |---|---|---|
 | 0 | Khảo sát repository | ✅ Hoàn thành |
 | 1 | Camera module | ✅ Hoàn thành |
-| 2 | Frame preprocessing | 🔜 Tiếp theo |
-| 3 | SCRFD face detection | ⏳ Chưa thực hiện |
+| 2 | Frame preprocessing | ✅ Hoàn thành |
+| 3 | SCRFD face detection | 🔜 Tiếp theo |
 | 4 | Face alignment & quality | ⏳ Chưa thực hiện |
 | 5 | ArcFace embedding | ⏳ Chưa thực hiện |
 | 6–16 | ... | ⏳ Chưa thực hiện |
