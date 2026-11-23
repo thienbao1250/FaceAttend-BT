@@ -11,12 +11,15 @@ numpy==2.5.4
 # --- AI Runtime ---
 onnxruntime==1.21.1          # CPU inference (đã xác nhận)
 
+# --- Database (Giai đoạn 9) ---
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg2-binary==2.9.10        # PostgreSQL driver (production)
+# python-dotenv==1.0.1         # Bỏ comment nếu muốn auto-load .env
+
 # --- Backend (Giai đoạn 10) ---
 # fastapi
 # uvicorn[standard]
-# sqlalchemy
-# alembic
-# psycopg2-binary
 
 # --- Testing ---
 pytest==9.2.0

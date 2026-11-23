@@ -11,3 +11,13 @@ data/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Secrets — KHÔNG commit lên Git
+.env
+*.env
+!.env.example
+
+# Database local (SQLite fallback)
+data/*.db
+data/*.db-shm
+data/*.db-wal

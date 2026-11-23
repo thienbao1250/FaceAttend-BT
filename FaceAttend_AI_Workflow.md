@@ -600,5 +600,6 @@ Gửi cấu trúc thư mục và nội dung các file có sẵn. Từ đó mới
 | 2026-11-13 | Giai đoạn 4 — Alignment + Quality | Hoàn thành `face_alignment.py` + `face_quality.py` | 47 unit tests passed; script `run_face_alignment.py` |
 | 2026-11-13 | Giai đoạn 5 — Face Embedding (ArcFace) | Hoàn thành `face_recognizer.py`; 42 unit tests passed | `w600k_r50.onnx`; embedding (512,) L2-norm; script `run_face_embedding.py` |
 | 2026-11-13 | Giai đoạn 6 — Face Matching | Hoàn thành `face_matcher.py`: FaceGallery + FaceMatcher + evaluate (FAR/FRR) | 3 trạng thái KNOWN/UNKNOWN/UNCERTAIN; script `run_face_matching.py` |
-| 2026-11-13 | Giai đoạn 7 — Employee Enrollment | Hoàn thành `enrollment_service.py`; 40 unit tests passed | Luồng: create_profile → add_sample → finalize; set_status/delete; script `run_enrollment.py` |
+| 2026-11-23 | Giai đoạn 7 — Employee Enrollment | Hoàn thành `enrollment_service.py`; 40 unit tests passed | Luồng: create_profile → add_sample → finalize; set_status/delete; script `run_enrollment.py` |
+| 2026-11-23 | Giai đoạn 9 — Database | Hoàn thành `app/database/`: models, connection, 3 repositories; 34 unit tests passed | SQLAlchemy 2.0 + Alembic; SQLite fallback (dev), PostgreSQL (prod); embedding lưu binary bytea |
 
