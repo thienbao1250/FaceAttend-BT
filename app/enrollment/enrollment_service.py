@@ -3,11 +3,12 @@ app/enrollment/enrollment_service.py
 Đăng ký khuôn mặt nhân viên — Giai đoạn 7.
 
 Luồng đăng ký:
-  1. Tạo hồ sơ nhân viên (employee_id + thông tin cơ bản).
+  1. Tạo hồ sơ nhân viên (employee_id tự động + thông tin cơ bản).
   2. Thu nhiều ảnh khuôn mặt; mỗi ảnh qua: detect → align → quality → embed.
   3. Lọc mẫu lỗi / chất lượng thấp; kiểm tra độ nhất quán giữa các mẫu.
-  4. Lưu embedding vào FaceGallery gắn với employee_id.
-  5. Cho phép cập nhật thêm mẫu, vô hiệu hóa hoặc xóa hồ sơ.
+  4. Kiểm tra trùng khuôn mặt với gallery hiện có trước khi finalize.
+  5. Lưu embedding vào FaceGallery gắn với employee_id.
+  6. Cho phép cập nhật thêm mẫu, vô hiệu hóa hoặc xóa hồ sơ.
 
 Bảo mật / Quyền riêng tư:
   - Không lưu ảnh gốc theo mặc định; chỉ giữ embedding đã chuẩn hóa.
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -53,6 +55,11 @@ MAX_SAMPLES_PER_EMPLOYEE: int = 10
 # Ngưỡng cosine similarity tối thiểu giữa các mẫu của cùng một người
 # (mẫu có thể hơi khác do góc, ánh sáng; nhưng quá thấp → có thể mẫu lỗi)
 MIN_INTRA_CONSISTENCY: float = 0.15
+
+# Ngưỡng phát hiện khuôn mặt trùng lặp trong gallery
+# Nếu embedding mới có max-sim ≥ ngưỡng này với BẤT KỲ nhân viên nào trong gallery
+# → từ chối đăng ký (cùng người đã tồn tại)
+DUPLICATE_FACE_THRESHOLD: float = 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +122,7 @@ class SampleStatus(Enum):
     EMBED_ERROR   = "embed_error"    # Lỗi khi tạo embedding
     INCONSISTENT  = "inconsistent"   # Mẫu không nhất quán với các mẫu trước
     MAX_REACHED   = "max_reached"    # Đã đủ số mẫu tối đa
+    DUPLICATE_FACE = "duplicate_face" # Khuôn mặt trùng với nhân viên đã đăng ký
 
 
 @dataclass
@@ -198,6 +206,7 @@ class EnrollmentService:
         max_samples:     int   = MAX_SAMPLES_PER_EMPLOYEE,
         min_consistency: float = MIN_INTRA_CONSISTENCY,
         save_images_dir: Optional[str | Path] = None,
+        duplicate_threshold: float = DUPLICATE_FACE_THRESHOLD,
     ) -> None:
         self._detector        = detector
         self._recognizer      = recognizer
@@ -207,6 +216,7 @@ class EnrollmentService:
         self._max_samples     = max_samples
         self._min_consistency = min_consistency
         self._save_images_dir = Path(save_images_dir) if save_images_dir else None
+        self._duplicate_threshold = duplicate_threshold
 
         # {employee_id: EmployeeProfile}
         self._profiles: dict[str, EmployeeProfile] = {}
@@ -219,6 +229,24 @@ class EnrollmentService:
     # ------------------------------------------------------------------
     # Quản lý hồ sơ
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def generate_employee_id(prefix: str = "EMP") -> str:
+        """
+        Tạo mã nhân viên duy nhất tự động.
+
+        Định dạng: <PREFIX>-<YYYYMMDD>-<4 ký tự UUID ngẫu nhiên viết hoa>
+        Ví dụ:     EMP-20261123-A3F7
+
+        Tham số:
+            prefix : tiền tố (mặc định "EMP"), có thể truyền "NV", "STAFF", v.v.
+
+        Trả về:
+            Chuỗi mã nhân viên duy nhất.
+        """
+        date_part = time.strftime("%Y%m%d")
+        rand_part = uuid.uuid4().hex[:4].upper()
+        return f"{prefix.upper()}-{date_part}-{rand_part}"
 
     def create_profile(
         self,
@@ -474,6 +502,25 @@ class EnrollmentService:
                     quality_result=quality_result,
                 )
 
+        # --- Kiểm tra trùng khuôn mặt với gallery hiện có ---
+        # Chỉ kiểm tra mẫu ĐẦU TIÊN của phiên (pending rỗng = chưa có mẫu nào)
+        if not pending_embs and self._gallery.size > 0:
+            dup_id, dup_sim = self._check_duplicate_in_gallery(embedding, employee_id)
+            if dup_id is not None:
+                logger.warning(
+                    "add_sample: phát hiện khuôn mặt trùng lặp — %s khớp với %s (sim=%.3f)",
+                    employee_id, dup_id, dup_sim,
+                )
+                return SampleResult(
+                    status=SampleStatus.DUPLICATE_FACE,
+                    message=(
+                        f"Khuôn mặt này đã được đăng ký với mã '{dup_id}' "
+                        f"(độ tương đồng={dup_sim:.2f}). "
+                        "Không thể đăng ký trùng khuôn mặt cho nhiều mã nhân viên."
+                    ),
+                    quality_result=quality_result,
+                )
+
         # --- Chấp nhận mẫu ---
         if employee_id not in self._pending:
             self._pending[employee_id] = []
@@ -616,6 +663,40 @@ class EnrollmentService:
         sims = [float(np.dot(new_emb, e)) for e in existing]
         min_sim = min(sims)
         return (min_sim >= self._min_consistency), min_sim
+
+    def _check_duplicate_in_gallery(
+        self,
+        embedding:   np.ndarray,
+        exclude_id:  str,
+    ) -> tuple[Optional[str], float]:
+        """
+        Kiểm tra embedding có trùng với nhân viên nào đó trong gallery không.
+
+        So sánh embedding với TẤT CẢ nhân viên trong gallery
+        (ngoại trừ chính employee_id đang đăng ký — để không tự so sánh với mình).
+
+        Trả về:
+            (dup_employee_id, max_similarity) nếu phát hiện trùng,
+            (None, 0.0) nếu không trùng.
+        """
+        best_id: Optional[str] = None
+        best_sim: float = 0.0
+
+        for emp_id in self._gallery.employee_ids:
+            if emp_id == exclude_id:
+                continue   # bỏ qua chính nhân viên đang cập nhật
+            mat = self._gallery.get_matrix(emp_id)
+            if mat is None:
+                continue
+            sims = mat @ embedding          # (N,)
+            max_sim = float(sims.max())
+            if max_sim > best_sim:
+                best_sim = max_sim
+                best_id  = emp_id
+
+        if best_id is not None and best_sim >= self._duplicate_threshold:
+            return best_id, best_sim
+        return None, best_sim
 
     # ------------------------------------------------------------------
     # Tiện ích thống kê

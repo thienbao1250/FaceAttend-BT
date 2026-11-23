@@ -110,15 +110,13 @@ def _draw_landmarks(frame: np.ndarray, landmarks: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 
 def _input_employee_info() -> tuple[str, str, str]:
-    """Nhập mã, tên và phòng ban nhân viên từ terminal."""
+    """Nhập tên và phòng ban nhân viên từ terminal; mã nhân viên được tạo tự động."""
     print("\n" + "=" * 50)
     print("  ĐĂNG KÝ NHÂN VIÊN MỚI")
     print("=" * 50)
-    while True:
-        emp_id = input("  Mã nhân viên (vd: EMP001): ").strip()
-        if emp_id:
-            break
-        print("  [!] Mã nhân viên không được để trống.")
+    # Tự động tạo mã nhân viên
+    emp_id = EnrollmentService.generate_employee_id("NV")
+    print(f"  Mã nhân viên   : {emp_id}  (tự động tạo)")
     while True:
         name = input("  Họ tên             : ").strip()
         if name:
@@ -308,6 +306,9 @@ def run(camera_index: int = 0, conf: float = 0.5) -> None:
                     elif result.status == SampleStatus.MAX_REACHED:
                         last_msg       = f"[MAX] {result.message}"
                         last_msg_color = ORANGE
+                    elif result.status == SampleStatus.DUPLICATE_FACE:
+                        last_msg       = f"[TRUNG] {result.message}"
+                        last_msg_color = RED
                     else:
                         last_msg       = f"[FAIL] {result.message}"
                         last_msg_color = RED
