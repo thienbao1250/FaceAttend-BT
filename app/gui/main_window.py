@@ -274,6 +274,7 @@ class AttendanceTab(ttk.Frame):
         self._var_last_vstatus = tk.StringVar(value="—")
         self._var_last_result = tk.StringVar(value="—")
         self._var_last_record_id = tk.StringVar(value="—")
+        self._var_last_shift_status = tk.StringVar(value="—")
 
         ttk.Label(recog_frame, text="Mã NV:", foreground=TK_SUBTEXT).grid(row=0, column=0, sticky="w")
         ttk.Label(recog_frame, textvariable=self._var_last_id,
@@ -309,6 +310,10 @@ class AttendanceTab(ttk.Frame):
         ttk.Label(recog_frame, text="Record ID:", foreground=TK_SUBTEXT).grid(row=9, column=0, sticky="w")
         ttk.Label(recog_frame, textvariable=self._var_last_record_id,
                   font=("Consolas", 9)).grid(row=9, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Trạng thái ca:", foreground=TK_SUBTEXT).grid(row=10, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_shift_status,
+                  font=("Consolas", 9, "bold")).grid(row=10, column=1, sticky="w")
 
         # Danh sách lịch sử
         hist_frame = ttk.LabelFrame(side, text=" 📋  Lịch sử sự kiện ", padding=4)
@@ -433,13 +438,13 @@ class AttendanceTab(ttk.Frame):
                             if decision.created:
                                 ev = decision.event
                                 icon = "CHECK-IN" if ev.event_type == EventType.CHECK_IN else "CHECK-OUT"
-                                punct = ""
-                                if ev.event_type == EventType.CHECK_IN:
-                                    punct = f" | {ev.punctuality_status.display_vi}"
-                                    if ev.late_minutes:
-                                        punct += f" ({ev.late_minutes}p)"
-                                line = f"[{icon}] {ev.employee_id} | {_now_local()}{punct}"
+                                punct = f" | {ev.punctuality_status.display_vi}"
+                                if ev.late_minutes:
+                                    punct += f" ({ev.late_minutes}p)"
+                                line = f"[{icon}] {ev.employee_id} | {_now_local()} | {ev.attendance_status.value}{punct}"
                                 self._add_event(line, ev)
+                            elif decision.message and match_result.employee_id:
+                                self.after(0, lambda m=decision.message: self._status_var.set(f"ℹ {m}"))
                         else:
                             box_color = CV_RED
                             if x2c > x1c and y2c > y1c:
@@ -503,19 +508,20 @@ class AttendanceTab(ttk.Frame):
             event_label = "✅ Check-in" if ev.event_type == EventType.CHECK_IN else "🚪 Check-out"
             self._var_last_type.set(event_label)
 
-            # Trạng thái đúng/trễ giờ (chỉ cho CHECK_IN)
-            if ev.event_type == EventType.CHECK_IN:
-                punct = ev.punctuality_status.display_vi
-                late_txt = f" ({ev.late_minutes} phút)" if ev.late_minutes else ""
-                self._var_last_punctuality.set(f"{punct}{late_txt}")
-            else:
-                self._var_last_punctuality.set("—")
+            # Trạng thái đúng/trễ giờ & về sớm
+            punct = ev.punctuality_status.display_vi
+            if ev.late_minutes:
+                punct += f" (trễ {ev.late_minutes}p)"
+            elif ev.early_leave_minutes:
+                punct += f" (sớm {ev.early_leave_minutes}p)"
+            self._var_last_punctuality.set(punct)
 
             self._var_last_device.set(ev.camera_id)
             self._var_last_method.set(ev.verify_method)
             self._var_last_vstatus.set(ev.verify_status)
             self._var_last_result.set(ev.result)
             self._var_last_record_id.set(str(ev.event_id))
+            self._var_last_shift_status.set(ev.attendance_status.value)
 
             # Thống kê
             self._var_total.set(str(self._attendance.total_events))

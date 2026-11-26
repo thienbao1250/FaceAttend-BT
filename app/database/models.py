@@ -28,13 +28,13 @@ Chính sách lưu trữ (theo đề xuất nghiệp vụ):
 
 from __future__ import annotations
 
-from datetime import date as date_type, datetime, timezone
+from datetime import date as date_type, datetime, time as time_type, timezone
 from typing import Optional
 
 import numpy as np
 from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Float, ForeignKey,
-    Index, Integer, LargeBinary, String, Text, UniqueConstraint,
+    Index, Integer, LargeBinary, String, Text, Time, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -504,26 +504,100 @@ class FaceRecognitionLog(Base):
 
 
 # ---------------------------------------------------------------------------
-# Model: attendance_records  (Bản ghi chính thức — Giai đoạn 10)
+# Model: shifts  (Ca làm việc — Giai đoạn 11)
+# ---------------------------------------------------------------------------
+
+class Shift(Base):
+    """
+    Cấu hình ca làm việc (ví dụ: Ca hành chính 08:00–17:00, Ca đêm 22:00–06:00).
+
+    Hỗ trợ:
+      - Nghỉ trưa/nghỉ giữa ca theo khung giờ (break_start – break_end)
+      - Grace period (thời gian ân hạn đi trễ)
+      - Ca qua ngày / ca đêm (is_overnight=True)
+      - Khung giờ hợp lệ để Check-in sớm và Check-out muộn
+    """
+    __tablename__ = "shifts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shift_code: Mapped[str] = mapped_column(
+        String(50), nullable=False, unique=True,
+        comment="Mã ca duy nhất, VD: HC_08_17, CA_DEM_22_06"
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    start_time: Mapped[time_type] = mapped_column(
+        Time, nullable=False, comment="Giờ bắt đầu ca (local time), VD: 08:00:00"
+    )
+    end_time: Mapped[time_type] = mapped_column(
+        Time, nullable=False, comment="Giờ kết thúc ca (local time), VD: 17:00:00"
+    )
+    break_start: Mapped[Optional[time_type]] = mapped_column(
+        Time, nullable=True, comment="Giờ bắt đầu nghỉ giữa ca, VD: 12:00:00"
+    )
+    break_end: Mapped[Optional[time_type]] = mapped_column(
+        Time, nullable=True, comment="Giờ kết thúc nghỉ giữa ca, VD: 13:00:00"
+    )
+    break_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60,
+        comment="Thời gian nghỉ tiêu chuẩn theo lịch (phút)"
+    )
+    standard_work_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=480,
+        comment="Thời gian làm việc tiêu chuẩn của ca (phút, mặc định 8h = 480p)"
+    )
+    grace_period_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5,
+        comment="Thời gian ân hạn đi trễ (phút)"
+    )
+    early_check_in_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=120,
+        comment="Cho phép check-in sớm tối đa trước giờ bắt đầu ca (phút)"
+    )
+    late_check_out_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=240,
+        comment="Cho phép check-out muộn tối đa sau giờ kết thúc ca (phút)"
+    )
+    is_overnight: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="True nếu ca làm qua nửa đêm (VD: 22:00 -> 06:00 hôm sau)"
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    attendance_records: Mapped[list["AttendanceRecord"]] = relationship(
+        "AttendanceRecord", back_populates="shift"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Shift id={self.id} code={self.shift_code!r} "
+            f"{self.start_time}-{self.end_time} overnight={self.is_overnight}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Model: attendance_records  (Bản ghi chính thức — Giai đoạn 10/11)
 # ---------------------------------------------------------------------------
 
 class AttendanceRecord(Base):
     """
-    Bản ghi chấm công CHÍNH THỨC theo ngày.
+    Bản ghi chấm công CHÍNH THỨC theo ca / ngày làm việc.
 
-    Chỉ lưu những sự kiện được hệ thống chấp nhận là chấm công hợp lệ.
-    Đây là bảng quan trọng nhất để tính công, báo cáo, và tuân thủ pháp luật.
+    Trạng thái nghiệp vụ bắt buộc (attendance_status):
+      - IN_PROGRESS : Đã Check-in nhưng chưa Check-out
+      - COMPLETED   : Đã có cả Check-in và Check-out
+      - INCOMPLETE  : Thiếu Check-in hoặc Check-out sau khi ca kết thúc và đã đối soát
 
-    Cấu trúc lưu trữ: phân rõ theo WorkDate (năm → tháng → ngày),
-    cho phép query nhanh theo khoảng thời gian bất kỳ.
-
-    Trường attendance_status (đúng giờ / trễ giờ):
-      - ON_TIME  : check-in <= work_start_time + late_threshold
-      - LATE     : check-in > work_start_time + late_threshold
-      - ABSENT   : không có check-in trong ngày
-      - HALF_DAY : chỉ làm nửa ca
-
-    Chính sách lưu trữ: theo thời hạn pháp luật hoặc thỏa thuận công ty.
+    Chỉ số thời gian:
+      - total_presence_minutes = CheckOutTime - CheckInTime
+      - break_minutes          = Thời gian nghỉ thực tế trong ca (theo lịch)
+      - actual_work_minutes    = TotalPresenceMinutes - BreakMinutes
+      - standard_work_minutes  = Thời gian tiêu chuẩn của ca
+      - missing_minutes        = MAX(0, StandardWorkMinutes - ActualWorkMinutes)
+      - extra_minutes          = MAX(0, ActualWorkMinutes - StandardWorkMinutes)
+      - overtime_minutes       = Chỉ ghi nhận khi có phê duyệt tăng ca (overtime_approved=True)
     """
     __tablename__ = "attendance_records"
 
@@ -537,6 +611,10 @@ class AttendanceRecord(Base):
         Integer, ForeignKey("employees.id", ondelete="RESTRICT"), nullable=False,
         comment="Không xóa cascade — giữ lịch sử dù nhân viên bị xóa"
     )
+    shift_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("shifts.id", ondelete="SET NULL"), nullable=True,
+        comment="FK đến ca làm việc (shifts)"
+    )
     work_date: Mapped["date_type"] = mapped_column(
         Date, nullable=False,
         comment="Ngày làm việc (YYYY-MM-DD). Phân cấp: năm → tháng → ngày"
@@ -545,7 +623,7 @@ class AttendanceRecord(Base):
     # --- Thông tin check-in ---
     check_in: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
-        comment="Thời điểm check-in — UTC (VD: 08:00:15)"
+        comment="Thời điểm check-in — UTC (CheckInTime)"
     )
     check_in_camera_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True
@@ -558,7 +636,7 @@ class AttendanceRecord(Base):
     # --- Thông tin check-out ---
     check_out: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
-        comment="Thời điểm check-out — UTC (VD: 17:05:20)"
+        comment="Thời điểm check-out — UTC (CheckOutTime)"
     )
     check_out_camera_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True
@@ -570,24 +648,66 @@ class AttendanceRecord(Base):
 
     # --- Trạng thái điểm danh ---
     attendance_status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="PRESENT",
-        comment="PRESENT | ABSENT | LATE | HALF_DAY | HOLIDAY | LEAVE"
+        String(20), nullable=False, default="IN_PROGRESS",
+        comment="IN_PROGRESS | COMPLETED | INCOMPLETE"
     )
     punctuality_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="ON_TIME",
-        comment="Trạng thái đúng/trễ giờ: ON_TIME | LATE | EARLY_LEAVE | UNKNOWN"
+        comment="Trạng thái đúng/trễ/về sớm: ON_TIME | LATE | EARLY_LEAVE | LATE_AND_EARLY | UNKNOWN"
     )
     late_minutes: Mapped[Optional[int]] = mapped_column(
-        Integer, nullable=True,
-        comment="Số phút đi trễ (0 nếu đúng giờ, NULL nếu không xác định)"
+        Integer, nullable=True, default=0,
+        comment="LateMinutes — số phút đi trễ"
     )
     early_leave_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0,
+        comment="EarlyLeaveMinutes — số phút về sớm"
+    )
+    total_presence_minutes: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True,
-        comment="Số phút về sớm (0 nếu đúng giờ, NULL nếu không xác định)"
+        comment="TotalPresenceMinutes = CheckOutTime - CheckInTime"
+    )
+    break_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0,
+        comment="BreakMinutes — thời gian nghỉ theo lịch được trừ"
+    )
+    actual_work_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="ActualWorkMinutes = TotalPresenceMinutes - BreakMinutes"
+    )
+    standard_work_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=480,
+        comment="StandardWorkMinutes — thời gian làm việc tiêu chuẩn"
+    )
+    missing_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0,
+        comment="MissingMinutes = MAX(0, StandardWorkMinutes - ActualWorkMinutes)"
+    )
+    extra_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0,
+        comment="ExtraMinutes = MAX(0, ActualWorkMinutes - StandardWorkMinutes)"
+    )
+    overtime_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="OvertimeMinutes — chỉ ghi nhận khi có phê duyệt tăng ca hợp lệ"
+    )
+    overtime_approved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="True nếu tăng ca đã được HR/Quản lý phê duyệt"
     )
     work_minutes: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True,
-        comment="Tổng số phút làm việc (check_out - check_in). NULL nếu chưa check-out"
+        comment="Alias tương thích ngược cho actual_work_minutes"
+    )
+
+    # --- Đối soát ngoại lệ (HR / Quản lý kiểm tra) ---
+    needs_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="True nếu thiếu Check-in / Check-out hoặc cần HR đối soát"
+    )
+    review_reason: Mapped[Optional[str]] = mapped_column(
+        String(200), nullable=True,
+        comment="VD: MISSING_CHECK_IN | MISSING_CHECK_OUT | OUTSIDE_SHIFT"
     )
 
     # --- Thông tin ca làm việc ---
@@ -634,6 +754,9 @@ class AttendanceRecord(Base):
     employee: Mapped["Employee"] = relationship(
         "Employee", back_populates="attendance_records"
     )
+    shift: Mapped[Optional["Shift"]] = relationship(
+        "Shift", back_populates="attendance_records"
+    )
     check_in_camera: Mapped[Optional["Camera"]] = relationship(
         "Camera", foreign_keys=[check_in_camera_id]
     )
@@ -652,6 +775,7 @@ class AttendanceRecord(Base):
         # Query theo trạng thái
         Index("ix_attendance_records_status", "attendance_status"),
         Index("ix_attendance_records_punctuality", "punctuality_status"),
+        Index("ix_attendance_records_needs_review", "needs_review"),
     )
 
     def to_display_dict(
@@ -663,16 +787,6 @@ class AttendanceRecord(Base):
         """
         Trả về dict hiển thị theo cấu trúc nghiệp vụ chuẩn.
         Dữ liệu hiển thị theo múi giờ local (mặc định GMT+7).
-
-        Ví dụ cấu trúc trả về:
-            Employee ID    : FA-IT-2026-0001
-            Thời gian      : 2026-11-26 08:05:30
-            Device ID      : CAM001
-            Phương thức    : Face Recognition
-            Event Type     : Check-in
-            Verify Status  : Success
-            Result         : Accepted
-            Record ID      : 100001
         """
         from datetime import timedelta
         tz = timezone(timedelta(hours=tz_offset_hours))
@@ -691,21 +805,30 @@ class AttendanceRecord(Base):
         event_dt = self.check_out if event_type.lower() == "check-out" and self.check_out else self.check_in
 
         return {
-            "Record ID":     self.id,
-            "Employee ID":   emp_display,
-            "Work Date":     str(self.work_date),
-            "Thời gian":     _fmt(event_dt),
-            "Device ID":     self.device_id,
-            "Phương thức":   self.verify_method,
-            "Event Type":    event_type,
-            "Verify Status": self.verify_status,
-            "Result":        self.result,
-            "Check-in":      _fmt(self.check_in),
-            "Check-out":     _fmt(self.check_out),
-            "Trạng thái":    self.attendance_status,
-            "Punctuality":   self.punctuality_status,
-            "Đi trễ (phút)": self.late_minutes,
-            "Làm (phút)":   self.work_minutes,
+            "Record ID":            self.id,
+            "Employee ID":          emp_display,
+            "Shift ID":             self.shift_id,
+            "Work Date":            str(self.work_date),
+            "Thời gian":            _fmt(event_dt),
+            "Device ID":            self.device_id,
+            "Phương thức":          self.verify_method,
+            "Event Type":           event_type,
+            "Verify Status":        self.verify_status,
+            "Result":               self.result,
+            "Check-in":             _fmt(self.check_in),
+            "Check-out":            _fmt(self.check_out),
+            "Trạng thái":           self.attendance_status,
+            "Punctuality":          self.punctuality_status,
+            "Đi trễ (phút)":        self.late_minutes,
+            "Về sớm (phút)":        self.early_leave_minutes,
+            "Có mặt (phút)":        self.total_presence_minutes,
+            "Nghỉ (phút)":          self.break_minutes,
+            "Làm (phút)":           self.actual_work_minutes if self.actual_work_minutes is not None else self.work_minutes,
+            "Tiêu chuẩn (phút)":    self.standard_work_minutes,
+            "Thiếu (phút)":         self.missing_minutes,
+            "Vượt giờ (phút)":      self.extra_minutes,
+            "Tăng ca duyệt (phút)": self.overtime_minutes,
+            "Cần đối soát":         self.needs_review,
         }
 
     def __repr__(self) -> str:

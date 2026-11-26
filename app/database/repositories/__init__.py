@@ -6,6 +6,7 @@ from app.database.repositories.face_template_repo import FaceTemplateRepository
 from app.database.repositories.attendance_repo import AttendanceRepository
 from app.database.repositories.attendance_record_repo import AttendanceRecordRepository
 from app.database.repositories.face_recognition_log_repo import FaceRecognitionLogRepository
+from app.database.repositories.shift_repo import ShiftRepository
 
 __all__ = [
     "EmployeeRepository",
@@ -13,4 +14,5 @@ __all__ = [
     "AttendanceRepository",
     "AttendanceRecordRepository",
     "FaceRecognitionLogRepository",
+    "ShiftRepository",
 ]

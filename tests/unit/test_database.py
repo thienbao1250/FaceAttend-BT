@@ -593,7 +593,7 @@ class TestAttendanceRecordRepository:
         assert rec.work_date.year == 2026
         assert rec.work_date.month == 11
         assert rec.work_date.day == 26
-        assert rec.attendance_status == "PRESENT"
+        assert rec.attendance_status == "IN_PROGRESS"
         assert rec.punctuality_status == "LATE"
         assert rec.late_minutes == 5
         assert rec.verify_method == "Face Recognition"
@@ -607,12 +607,18 @@ class TestAttendanceRecordRepository:
         checkout_utc = datetime(2026, 11, 26, 10, 5, 20, tzinfo=timezone.utc)  # 17:05:20 GMT+7
 
         repo.upsert_check_in(emp.id, checkin_utc, punctuality_status="ON_TIME", late_minutes=0)
-        rec = repo.upsert_check_out(emp.id, checkout_utc, confidence=0.93)
+        rec = repo.upsert_check_out(emp.id, checkout_utc, confidence=0.93, break_minutes=60)
         db_session.commit()
 
         assert rec is not None
         assert rec.check_out is not None
-        assert rec.work_minutes == 9 * 60 + 5  # 545 phút
+        assert rec.attendance_status == "COMPLETED"
+        assert rec.total_presence_minutes == 545
+        assert rec.break_minutes == 60
+        assert rec.actual_work_minutes == 485
+        assert rec.work_minutes == 485
+        assert rec.extra_minutes == 5
+        assert rec.overtime_minutes == 0
 
     def test_to_display_dict_matches_business_format(self, db_session):
         emp = self._emp(db_session, "FA-IT-2026-0003")
@@ -671,3 +677,63 @@ class TestAttendanceRecordRepository:
         assert updated.punctuality_status == "ON_TIME"
         assert updated.record_source == "corrected"
         assert updated.note == "Xin phép đi muộn được duyệt"
+
+
+    def test_missing_checkin_checkout_marks_incomplete_and_needs_review(self, db_session):
+        emp = self._emp(db_session, "FA-IT-2026-0006")
+        repo = self._repo(db_session)
+        checkout_utc = datetime(2026, 11, 26, 10, 0, 0, tzinfo=timezone.utc)
+        rec = repo.record_missing_checkin_checkout(emp.id, checkout_utc)
+        db_session.commit()
+        assert rec.attendance_status == "INCOMPLETE"
+        assert rec.check_in is None
+        assert rec.needs_review is True
+        assert rec.review_reason == "MISSING_CHECK_IN"
+        assert len(repo.list_needs_review()) >= 1
+
+    def test_reconcile_incomplete_records_and_approve_overtime(self, db_session):
+        from datetime import date as date_type
+        emp = self._emp(db_session, "FA-IT-2026-0007")
+        repo = self._repo(db_session)
+        shift_end_utc = datetime(2026, 11, 26, 10, 0, 0, tzinfo=timezone.utc)
+        rec = repo.upsert_check_in(
+            emp.id,
+            datetime(2026, 11, 26, 1, 0, 0, tzinfo=timezone.utc),
+            shift_end=shift_end_utc,
+        )
+        db_session.commit()
+
+        # Trước khi hết ca -> không chuyển INCOMPLETE
+        assert repo.reconcile_incomplete_records(date_type(2026, 11, 26), shift_end_utc - timedelta(minutes=10)) == 0
+        # Sau khi hết ca -> chuyển INCOMPLETE
+        assert repo.reconcile_incomplete_records(date_type(2026, 11, 26), shift_end_utc + timedelta(minutes=10)) == 1
+        db_session.commit()
+        reloaded = repo.get_by_id(rec.id)
+        assert reloaded.attendance_status == "INCOMPLETE"
+        assert reloaded.needs_review is True
+        assert reloaded.review_reason == "MISSING_CHECK_OUT"
+
+        # Approve overtime
+        repo.approve_overtime(rec.id, approved_minutes=60, note="Đã duyệt OT")
+        db_session.commit()
+        reloaded2 = repo.get_by_id(rec.id)
+        assert reloaded2.overtime_minutes == 60
+        assert reloaded2.overtime_approved is True
+
+
+# ===========================================================================
+# Tests: ShiftRepository — Giai đoạn 11
+# ===========================================================================
+
+class TestShiftRepository:
+
+    def test_get_or_create_default_shift(self, db_session):
+        from app.database.repositories.shift_repo import ShiftRepository
+        repo = ShiftRepository(db_session)
+        s1 = repo.get_or_create_default()
+        db_session.commit()
+        s2 = repo.get_or_create_default()
+        assert s1.id == s2.id
+        assert s1.shift_code == "HC_08_17"
+        assert s1.standard_work_minutes == 480
+        assert s1.break_minutes == 60

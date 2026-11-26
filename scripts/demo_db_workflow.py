@@ -29,6 +29,7 @@ from app.database.repositories.face_template_repo import FaceTemplateRepository
 from app.database.repositories.attendance_repo import AttendanceRepository
 from app.database.repositories.face_recognition_log_repo import FaceRecognitionLogRepository
 from app.database.repositories.attendance_record_repo import AttendanceRecordRepository
+from app.database.repositories.shift_repo import ShiftRepository
 from app.vision.face_matcher import FaceGallery, FaceMatcher, MatchStatus
 
 
@@ -52,6 +53,8 @@ def main():
         att_repo = AttendanceRepository(session)
         log_repo = FaceRecognitionLogRepository(session)
         rec_repo = AttendanceRecordRepository(session)
+        shift_repo = ShiftRepository(session)
+        default_shift = shift_repo.get_or_create_default()
 
         # Tạo camera mặc định nếu chưa có
         from app.database.models import Camera
@@ -142,6 +145,8 @@ def main():
                 confidence=match_res.similarity,
                 punctuality_status="ON_TIME",
                 late_minutes=0,
+                shift_id=default_shift.id,
+                standard_work_minutes=default_shift.standard_work_minutes,
                 device_id=cam.camera_code,
             )
             
@@ -159,13 +164,14 @@ def main():
             print(f"  [DB]: Ghi AttendanceRecord (AttendanceId={att_rec.id}, Status={att_rec.attendance_status}, Punctuality={att_rec.punctuality_status})")
             print(f"  [DB]: Ghi nhận CHECK-IN thành công (Event ID={ev1.id}) lúc {ev1.event_time.strftime('%H:%M:%S UTC')}")
 
-            # Thử ghi nhận check-out sau 8 tiếng
-            t_out = now + timedelta(hours=8)
+            # Thử ghi nhận check-out sau 9 tiếng (8h làm + 1h nghỉ trưa)
+            t_out = now + timedelta(hours=9)
             rec_repo.upsert_check_out(
                 employee_id=emp_matched_id,
                 check_out=t_out,
                 camera_id=cam.id,
                 confidence=match_res.similarity,
+                break_minutes=default_shift.break_minutes,
             )
             ev2 = att_repo.record_event(
                 employee_id=emp_matched_id,
