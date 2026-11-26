@@ -65,6 +65,7 @@ class MatchResult:
     Thuộc tính:
         status              : MatchStatus (KNOWN / UNKNOWN / UNCERTAIN)
         employee_id         : mã nhân viên nếu KNOWN, None nếu không
+        employee_name       : tên nhân viên nếu KNOWN, None nếu không
         similarity          : cosine similarity cao nhất (best match)
         runner_up_id        : mã nhân viên có điểm cao thứ nhì (nếu có)
         runner_up_similarity: điểm cosine của người thứ nhì
@@ -73,6 +74,7 @@ class MatchResult:
     """
     status:               MatchStatus
     employee_id:          Optional[str]  = None
+    employee_name:        Optional[str]  = None
     similarity:           float          = 0.0
     runner_up_id:         Optional[str]  = None
     runner_up_similarity: float          = 0.0
@@ -83,6 +85,8 @@ class MatchResult:
         parts = [f"[{self.status.value.upper()}]"]
         if self.employee_id:
             parts.append(f"id={self.employee_id}")
+        if self.employee_name:
+            parts.append(f"name={self.employee_name}")
         parts.append(f"sim={self.similarity:.4f}")
         if self.runner_up_id:
             parts.append(f"runner_up={self.runner_up_id}({self.runner_up_similarity:.4f})")
@@ -171,23 +175,28 @@ class FaceGallery:
     def __init__(self) -> None:
         # {employee_id: list of ndarray (512,)}
         self._data: dict[str, list[np.ndarray]] = {}
+        # {employee_id: tên hiển thị}
+        self._names: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
 
-    def add(self, employee_id: str, embedding: np.ndarray) -> None:
+    def add(self, employee_id: str, embedding: np.ndarray, name: str = "") -> None:
         """
         Thêm một embedding mẫu cho nhân viên.
 
         Tham số:
             employee_id : mã nhân viên duy nhất (string)
             embedding   : ndarray (D,) float32, đã L2-normalize
+            name        : tên nhân viên (tùy chọn, dùng để hiển thị khi nhận diện)
         """
         self._validate_embedding(embedding)
         if employee_id not in self._data:
             self._data[employee_id] = []
         self._data[employee_id].append(embedding.astype(np.float32))
+        if name:
+            self._names[employee_id] = name
         logger.debug(
             "Gallery.add: %s → tổng %d mẫu",
             employee_id,
@@ -206,6 +215,14 @@ class FaceGallery:
         for emb in embeddings:
             self.add(employee_id, emb)
 
+    def set_name(self, employee_id: str, name: str) -> None:
+        """Gắn tên hiển thị cho nhân viên trong gallery."""
+        self._names[employee_id] = name
+
+    def get_name(self, employee_id: str) -> str:
+        """Trả tên nhân viên, hoặc chuỗi rỗng nếu không có."""
+        return self._names.get(employee_id, "")
+
     def remove(self, employee_id: str) -> bool:
         """
         Xóa tất cả mẫu của nhân viên.
@@ -213,6 +230,7 @@ class FaceGallery:
         """
         if employee_id in self._data:
             del self._data[employee_id]
+            self._names.pop(employee_id, None)
             logger.info("Gallery.remove: đã xóa %s", employee_id)
             return True
         return False
@@ -220,6 +238,7 @@ class FaceGallery:
     def clear(self) -> None:
         """Xóa toàn bộ gallery."""
         self._data.clear()
+        self._names.clear()
         logger.info("Gallery.clear: đã xóa tất cả nhân viên.")
 
     # ------------------------------------------------------------------
@@ -228,7 +247,8 @@ class FaceGallery:
 
     def save(self, filepath: str | Path) -> None:
         """
-        Lưu toàn bộ vector embedding trong gallery ra file nhị phân npz.
+        Lưu toàn bộ vector embedding và tên nhân viên vào file nhị phân npz.
+        Tên nhân viên được lưu với key đặc biệt: '__names__<id>'
         """
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -237,11 +257,14 @@ class FaceGallery:
             for emp_id, embs in self._data.items()
             if embs
         }
+        # Lưu tên nhân viên dưới dạng array 1 phần tử kiểu str
+        for emp_id, name in self._names.items():
+            data_to_save[f"__name__{emp_id}"] = np.array([name])
         np.savez_compressed(filepath, **data_to_save)
-        logger.info("FaceGallery.save: Đã lưu %d nhân viên vào %s", len(data_to_save), filepath)
+        logger.info("FaceGallery.save: Đã lưu %d nhân viên vào %s", len(self._data), filepath)
 
     @classmethod
-    def load(cls, filepath: str | Path) -> FaceGallery:
+    def load(cls, filepath: str | Path) -> "FaceGallery":
         """
         Nạp gallery từ file nhị phân npz.
         Nếu file chưa tồn tại, trả về một FaceGallery rỗng.
@@ -253,11 +276,18 @@ class FaceGallery:
             return gallery
 
         try:
-            with np.load(filepath) as data:
-                for emp_id in data.files:
-                    matrix = data[emp_id]
-                    for emb in matrix:
-                        gallery.add(emp_id, emb)
+            with np.load(filepath, allow_pickle=False) as data:
+                for key in data.files:
+                    if key.startswith("__name__"):
+                        # Khôi phục tên nhân viên
+                        emp_id = key[len("__name__"):]
+                        name_arr = data[key]
+                        if name_arr.size > 0:
+                            gallery._names[emp_id] = str(name_arr.flat[0])
+                    else:
+                        matrix = data[key]
+                        for emb in matrix:
+                            gallery.add(key, emb)
             logger.info(
                 "FaceGallery.load: Đã nạp %d nhân viên (%d mẫu) từ %s",
                 gallery.size, gallery.total_samples, filepath
@@ -433,6 +463,7 @@ class FaceMatcher:
         result = MatchResult(
             status=status,
             employee_id=matched_id,
+            employee_name=self.gallery.get_name(matched_id) if matched_id else None,
             similarity=best_sim,
             runner_up_id=runner_up_id,
             runner_up_similarity=runner_up_sim,

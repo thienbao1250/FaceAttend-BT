@@ -234,12 +234,14 @@ def run(camera_index: int = 0, conf: float = 0.5) -> None:
                         if best.landmarks is not None:
                             _draw_landmarks(display, best.landmarks)
 
-                        # Nhãn tên nhân viên
-                        label = (
-                            match_result.employee_id
-                            if match_result.employee_id
-                            else match_result.status.value.upper()
-                        )
+                        # Nhãn tên nhân viên — hiển thị "Mã - Tên" nếu có tên
+                        if match_result.employee_id:
+                            if match_result.employee_name:
+                                label = f"{match_result.employee_id} - {match_result.employee_name}"
+                            else:
+                                label = match_result.employee_id
+                        else:
+                            label = match_result.status.value.upper()
                         sim_txt = f"{match_result.similarity:.2f}"
                         _put(display, f"{label}  {sim_txt}",
                              (x1c + 2, max(y1c - 8, 14)), box_color, 0.55, 2)

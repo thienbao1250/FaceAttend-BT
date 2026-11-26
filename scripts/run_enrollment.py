@@ -318,6 +318,10 @@ def run(camera_index: int = 0, conf: float = 0.5) -> None:
                 elif key == ord("f"):   # Finalize
                     final = service.finalize(current_emp_id)
                     if final.success:
+                        # Lưu tên nhân viên vào gallery để hiển thị khi nhận diện
+                        profile = service.get_profile(current_emp_id)
+                        if profile:
+                            gallery.set_name(current_emp_id, profile.name)
                         # Lưu gallery vector ra file npz
                         gallery.save(GALLERY_FILE_PATH)
                         last_msg       = f"[THANH CONG] {final.message}"
