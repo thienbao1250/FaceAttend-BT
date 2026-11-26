@@ -463,3 +463,182 @@ class TestEdgeCases:
         after = time.time()
         assert d.created is True
         assert before <= d.event.timestamp_utc <= after
+
+
+# ---------------------------------------------------------------------------
+# Test: PunctualityStatus — Giai đoạn 10
+# ---------------------------------------------------------------------------
+
+class TestPunctualityStatus:
+    """
+    Test trạng thái đúng/trễ giờ khi CHECK_IN.
+    Ca mặc định: 08:00. Ngưỡng trễ: 5 phút.
+    """
+
+    @pytest.fixture
+    def svc_with_shift(self):
+        """AttendanceService với ca 08:00, ngưỡng trễ 5 phút."""
+        return AttendanceService(
+            cooldown_seconds=30.0,
+            min_toggle_seconds=60.0,
+            shift_start_hour=8,
+            shift_start_minute=0,
+            late_threshold_minutes=5,
+        )
+
+    # T_ONTIME: 2026-11-26 08:00:00 UTC+7 → epoch UTC
+    # datetime(2026, 11, 26, 8, 0, 0, tzinfo=UTC+7) = datetime(2026, 11, 26, 1, 0, 0, tzinfo=UTC)
+    from datetime import timezone as _tz, timedelta as _td
+    _VN = _tz(_td(hours=7))
+
+    def _epoch(self, h: int, m: int, s: int = 0) -> float:
+        """Chuyển giờ local 2026-11-26 HH:MM:SS (UTC+7) → epoch UTC."""
+        from datetime import datetime, timezone, timedelta
+        vn = timezone(timedelta(hours=7))
+        dt = datetime(2026, 11, 26, h, m, s, tzinfo=vn)
+        return dt.timestamp()
+
+    def test_check_in_exactly_on_time(self, svc_with_shift):
+        """Check-in đúng 08:00 → ON_TIME."""
+        t = self._epoch(8, 0, 0)
+        d = svc_with_shift.process(_known(), timestamp=t)
+        assert d.created is True
+        assert d.event.event_type == EventType.CHECK_IN
+        from app.attendance.attendance_service import PunctualityStatus
+        assert d.event.punctuality_status == PunctualityStatus.ON_TIME
+        assert d.event.late_minutes == 0
+
+    def test_check_in_within_threshold_on_time(self, svc_with_shift):
+        """Check-in 08:04 (4 phút, dưới ngưỡng 5p) → ON_TIME."""
+        t = self._epoch(8, 4, 0)
+        d = svc_with_shift.process(_known(), timestamp=t)
+        from app.attendance.attendance_service import PunctualityStatus
+        assert d.event.punctuality_status == PunctualityStatus.ON_TIME
+
+    def test_check_in_at_threshold_on_time(self, svc_with_shift):
+        """Check-in đúng 08:05 (= ngưỡng 5p) → ON_TIME."""
+        t = self._epoch(8, 5, 0)
+        d = svc_with_shift.process(_known(), timestamp=t)
+        from app.attendance.attendance_service import PunctualityStatus
+        assert d.event.punctuality_status == PunctualityStatus.ON_TIME
+
+    def test_check_in_over_threshold_late(self, svc_with_shift):
+        """Check-in 08:06 (6 phút, vượt ngưỡng 5p) → LATE."""
+        t = self._epoch(8, 6, 0)
+        d = svc_with_shift.process(_known(), timestamp=t)
+        from app.attendance.attendance_service import PunctualityStatus
+        assert d.event.punctuality_status == PunctualityStatus.LATE
+        assert d.event.late_minutes == 6
+
+    def test_check_in_very_late(self, svc_with_shift):
+        """Check-in 09:30 (90 phút) → LATE, late_minutes=90."""
+        t = self._epoch(9, 30, 0)
+        d = svc_with_shift.process(_known(), timestamp=t)
+        from app.attendance.attendance_service import PunctualityStatus
+        assert d.event.punctuality_status == PunctualityStatus.LATE
+        assert d.event.late_minutes == 90
+
+    def test_check_out_has_unknown_punctuality(self, svc_with_shift):
+        """CHECK_OUT không tính punctuality (chỉ CHECK_IN mới tính)."""
+        t0 = self._epoch(8, 0, 0)
+        svc_with_shift.process(_known(), timestamp=t0)             # CHECK_IN
+        t_out = t0 + 3600 * 9  # 9 giờ sau
+        d = svc_with_shift.process(_known(), timestamp=t_out)      # CHECK_OUT
+        from app.attendance.attendance_service import PunctualityStatus
+        assert d.event.event_type == EventType.CHECK_OUT
+        assert d.event.punctuality_status == PunctualityStatus.UNKNOWN
+
+    def test_to_display_dict_has_required_fields(self):
+        """to_display_dict() trả về đủ 10 trường theo cấu trúc nghiệp vụ."""
+        from app.attendance.attendance_service import AttendanceEvent, EventType, PunctualityStatus
+        ev = AttendanceEvent(
+            event_id=100001,
+            employee_id="FA-IT-2026-0001",
+            event_type=EventType.CHECK_IN,
+            timestamp_utc=T0,
+            camera_id="CAM001",
+            similarity=0.92,
+            punctuality_status=PunctualityStatus.LATE,
+            late_minutes=5,
+            verify_method="Face Recognition",
+            verify_status="Success",
+            result="Accepted",
+        )
+        d = ev.to_display_dict(employee_code="FA-IT-2026-0001")
+        required = [
+            "Employee ID", "Thời gian", "Device ID", "Phương thức",
+            "Event Type", "Verify Status", "Result", "Record ID",
+            "Trạng thái", "Đi trễ (phút)",
+        ]
+        for field in required:
+            assert field in d, f"Thiếu trường: {field}"
+
+        assert d["Employee ID"] == "FA-IT-2026-0001"
+        assert d["Event Type"] == "Check-in"
+        assert d["Verify Status"] == "Success"
+        assert d["Result"] == "Accepted"
+        assert d["Record ID"] == 100001
+        assert d["Device ID"] == "CAM001"
+        assert d["Phương thức"] == "Face Recognition"
+
+    def test_punctuality_display_vi_on_time(self):
+        from app.attendance.attendance_service import PunctualityStatus
+        assert "Đúng giờ" in PunctualityStatus.ON_TIME.display_vi
+
+    def test_punctuality_display_vi_late(self):
+        from app.attendance.attendance_service import PunctualityStatus
+        assert "Trễ" in PunctualityStatus.LATE.display_vi
+
+    def test_to_dict_has_punctuality_fields(self, svc_with_shift):
+        """to_dict() có đủ trường punctuality_status và late_minutes."""
+        t = self._epoch(8, 10, 0)
+        d = svc_with_shift.process(_known(), timestamp=t)
+        ev_dict = d.event.to_dict()
+        assert "punctuality_status" in ev_dict
+        assert "late_minutes" in ev_dict
+        assert "verify_method" in ev_dict
+        assert "verify_status" in ev_dict
+        assert "result" in ev_dict
+
+
+    def test_export_csv_includes_punctuality_and_verify_fields(self, svc, tmp_path):
+        from datetime import datetime, timezone, timedelta
+        vn = timezone(timedelta(hours=7))
+        t = datetime(2026, 11, 26, 8, 5, 30, tzinfo=vn).timestamp()
+        svc.process(_known("FA-IT-2026-0001"), camera_id="CAM001", timestamp=t)
+        filepath = str(tmp_path / "attendance.csv")
+        svc.export_csv(filepath)
+
+        import csv
+        with open(filepath, encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 1
+        assert rows[0]["punctuality_status"] in ("ON_TIME", "LATE")
+        assert rows[0]["verify_method"] == "Face Recognition"
+        assert rows[0]["verify_status"] == "Success"
+        assert rows[0]["result"] == "Accepted"
+
+    def test_export_by_date_creates_year_month_day_hierarchy(self, svc, tmp_path):
+        """export_by_date() tạo cấu trúc thư mục Năm/Tháng/Ngày (YYYY/MM/DD)."""
+        from datetime import datetime, timezone, timedelta
+        vn = timezone(timedelta(hours=7))
+        t1 = datetime(2026, 11, 26, 8, 0, 0, tzinfo=vn).timestamp()
+        t2 = datetime(2026, 11, 27, 8, 10, 0, tzinfo=vn).timestamp()
+        svc.process(_known("EMP001"), timestamp=t1)
+        svc.process(_known("EMP002"), timestamp=t2)
+
+        dirs = svc.export_by_date(tmp_path)
+        assert len(dirs) == 2
+
+        day1_dir = tmp_path / "2026" / "11" / "26"
+        day2_dir = tmp_path / "2026" / "11" / "27"
+        assert (day1_dir / "attendance.json").exists()
+        assert (day1_dir / "attendance.csv").exists()
+        assert (day2_dir / "attendance.json").exists()
+        assert (day2_dir / "attendance.csv").exists()
+
+        import json
+        data1 = json.loads((day1_dir / "attendance.json").read_text(encoding="utf-8"))
+        data2 = json.loads((day2_dir / "attendance.json").read_text(encoding="utf-8"))
+        assert len(data1) == 1 and data1[0]["employee_id"] == "EMP001"
+        assert len(data2) == 1 and data2[0]["employee_id"] == "EMP002"

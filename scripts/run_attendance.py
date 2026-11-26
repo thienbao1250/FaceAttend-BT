@@ -1,6 +1,6 @@
 """
 scripts/run_attendance.py
-Demo Giai đoạn 8 — Pipeline điểm danh đầy đủ.
+Demo Giai đoạn 10 — Pipeline điểm danh đầy đủ.
 
 Camera → SCRFD detect → align → quality → ArcFace embed
 → FaceMatcher → AttendanceService → HUD + lịch sử
@@ -39,6 +39,7 @@ from app.vision.face_matcher import FaceGallery, FaceMatcher, MatchStatus, Match
 from app.attendance.attendance_service import (
     AttendanceService,
     EventType,
+    PunctualityStatus,
     SkipReason,
     DEFAULT_TIMEZONE,
 )
@@ -54,7 +55,7 @@ logging.basicConfig(
 DETECTOR_PATH    = ROOT / "models" / "det_10g.onnx"
 RECOGNIZER_PATH  = ROOT / "models" / "w600k_r50.onnx"
 GALLERY_FILE     = ROOT / "data" / "gallery.npz"
-ATTENDANCE_LOG   = ROOT / "data" / "attendance_log.json"
+ATTENDANCE_DIR   = ROOT / "data" / "attendance"
 
 # ---------------------------------------------------------------------------
 # Tham số nghiệp vụ điểm danh
@@ -251,7 +252,13 @@ def run(camera_index: int = 0, conf: float = 0.5) -> None:
                         if decision.created:
                             ev = decision.event
                             icon  = "IN " if ev.event_type == EventType.CHECK_IN else "OUT"
-                            line  = f"[{icon}] {ev.employee_id}  {_now_local()}"
+                            # Hiển thị trạng thái đúng/trễ giờ
+                            punct_txt = ""
+                            if ev.event_type == EventType.CHECK_IN:
+                                punct_txt = f"  {ev.punctuality_status.display_vi}"
+                                if ev.late_minutes:
+                                    punct_txt += f" ({ev.late_minutes}p)"
+                            line  = f"[{icon}] {ev.employee_id}  {_now_local()}{punct_txt}"
                             flash_msg    = line
                             flash_color  = GREEN if ev.event_type == EventType.CHECK_IN else CYAN
                             flash_until  = time.time() + 2.5
@@ -312,17 +319,18 @@ def run(camera_index: int = 0, conf: float = 0.5) -> None:
     finally:
         cv2.destroyAllWindows()
 
-    # --- Xuất log khi thoát ---
+    # --- Xuất log khi thoát (phân cấp Năm/Tháng/Ngày) ---
     total_time = time.time() - start_time
     avg_fps    = frame_count / total_time if total_time > 0 else 0
 
     attendance.print_summary()
-    attendance.export_json(str(ATTENDANCE_LOG))
-    attendance.export_csv(str(ATTENDANCE_LOG.with_suffix(".csv")))
+    written_dirs = attendance.export_by_date(ATTENDANCE_DIR)
 
     print(f"  Thời gian: {total_time:.1f}s  |  FPS TB: {avg_fps:.1f}")
-    print(f"  Đã xuất log → {ATTENDANCE_LOG.relative_to(ROOT)}")
-    print(f"             → {ATTENDANCE_LOG.with_suffix('.csv').relative_to(ROOT)}")
+    for d in written_dirs:
+        rel = d.relative_to(ROOT)
+        print(f"  Đã xuất log → {rel / 'attendance.json'}")
+        print(f"             → {rel / 'attendance.csv'}")
 
 
 if __name__ == "__main__":

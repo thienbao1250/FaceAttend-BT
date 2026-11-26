@@ -55,7 +55,7 @@ from app.vision.face_quality import FaceQualityChecker, QualityThresholds
 from app.vision.face_recognizer import FaceRecognizer
 from app.vision.face_matcher import FaceGallery, FaceMatcher, MatchStatus, MatchThresholds
 from app.attendance.attendance_service import (
-    AttendanceService, EventType, SkipReason, DEFAULT_TIMEZONE,
+    AttendanceService, EventType, PunctualityStatus, SkipReason, DEFAULT_TIMEZONE,
 )
 from app.enrollment.enrollment_service import (
     EnrollmentService, SampleStatus, MIN_SAMPLES_REQUIRED,
@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 DETECTOR_PATH   = ROOT / "models" / "det_10g.onnx"
 RECOGNIZER_PATH = ROOT / "models" / "w600k_r50.onnx"
 GALLERY_FILE    = ROOT / "data" / "gallery.npz"
-ATTENDANCE_LOG  = ROOT / "data" / "attendance_log"
+ATTENDANCE_DIR  = ROOT / "data" / "attendance"
 FACES_DIR       = ROOT / "data" / "registered_faces"
 
 COMPANY_CODE = os.environ.get("COMPANY_CODE", "FA")
@@ -268,6 +268,12 @@ class AttendanceTab(ttk.Frame):
         self._var_last_name = tk.StringVar(value="—")
         self._var_last_time = tk.StringVar(value="—")
         self._var_last_type = tk.StringVar(value="—")
+        self._var_last_punctuality = tk.StringVar(value="—")
+        self._var_last_device = tk.StringVar(value="—")
+        self._var_last_method = tk.StringVar(value="Face Recognition")
+        self._var_last_vstatus = tk.StringVar(value="—")
+        self._var_last_result = tk.StringVar(value="—")
+        self._var_last_record_id = tk.StringVar(value="—")
 
         ttk.Label(recog_frame, text="Mã NV:", foreground=TK_SUBTEXT).grid(row=0, column=0, sticky="w")
         ttk.Label(recog_frame, textvariable=self._var_last_id,
@@ -283,6 +289,26 @@ class AttendanceTab(ttk.Frame):
 
         ttk.Label(recog_frame, text="Thời gian:", foreground=TK_SUBTEXT).grid(row=3, column=0, sticky="w")
         ttk.Label(recog_frame, textvariable=self._var_last_time).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Trạng thái:", foreground=TK_SUBTEXT).grid(row=4, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_punctuality,
+                  font=("Arial", 10, "bold")).grid(row=4, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Device ID:", foreground=TK_SUBTEXT).grid(row=5, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_device).grid(row=5, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Phương thức:", foreground=TK_SUBTEXT).grid(row=6, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_method).grid(row=6, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Verify Status:", foreground=TK_SUBTEXT).grid(row=7, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_vstatus).grid(row=7, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Result:", foreground=TK_SUBTEXT).grid(row=8, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_result).grid(row=8, column=1, sticky="w")
+
+        ttk.Label(recog_frame, text="Record ID:", foreground=TK_SUBTEXT).grid(row=9, column=0, sticky="w")
+        ttk.Label(recog_frame, textvariable=self._var_last_record_id,
+                  font=("Consolas", 9)).grid(row=9, column=1, sticky="w")
 
         # Danh sách lịch sử
         hist_frame = ttk.LabelFrame(side, text=" 📋  Lịch sử sự kiện ", padding=4)
@@ -330,10 +356,9 @@ class AttendanceTab(ttk.Frame):
         self._status_var.set("↺ Đã reset cooldown/tracking")
 
     def _export(self) -> None:
-        path = ATTENDANCE_LOG
-        self._attendance.export_json(str(path.with_suffix(".json")))
-        self._attendance.export_csv(str(path.with_suffix(".csv")))
-        messagebox.showinfo("Xuất log", f"Đã lưu log:\n{path}.json\n{path}.csv")
+        dirs = self._attendance.export_by_date(ATTENDANCE_DIR)
+        paths_txt = "\n".join(str(d) for d in dirs)
+        messagebox.showinfo("Xuất log", f"Đã lưu log theo ngày (Năm/Tháng/Ngày):\n{paths_txt}")
 
     # ------------------------------------------------------------------
     # Vòng lặp camera (chạy trong thread riêng)
@@ -408,7 +433,12 @@ class AttendanceTab(ttk.Frame):
                             if decision.created:
                                 ev = decision.event
                                 icon = "CHECK-IN" if ev.event_type == EventType.CHECK_IN else "CHECK-OUT"
-                                line = f"[{icon}] {ev.employee_id} | {_now_local()}"
+                                punct = ""
+                                if ev.event_type == EventType.CHECK_IN:
+                                    punct = f" | {ev.punctuality_status.display_vi}"
+                                    if ev.late_minutes:
+                                        punct += f" ({ev.late_minutes}p)"
+                                line = f"[{icon}] {ev.employee_id} | {_now_local()}{punct}"
                                 self._add_event(line, ev)
                         else:
                             box_color = CV_RED
@@ -466,13 +496,26 @@ class AttendanceTab(ttk.Frame):
             if self._listbox.size() > 50:
                 self._listbox.delete(50, tk.END)
 
-            # Thẻ nhận diện gần nhất
+            # Thẻ nhận diện gần nhất — đầy đủ theo cấu trúc nghiệp vụ
             self._var_last_id.set(ev.employee_id)
             self._var_last_name.set(name or "—")
             self._var_last_time.set(_now_local())
-            self._var_last_type.set(
-                "✅ CHECK-IN" if ev.event_type == EventType.CHECK_IN else "🚪 CHECK-OUT"
-            )
+            event_label = "✅ Check-in" if ev.event_type == EventType.CHECK_IN else "🚪 Check-out"
+            self._var_last_type.set(event_label)
+
+            # Trạng thái đúng/trễ giờ (chỉ cho CHECK_IN)
+            if ev.event_type == EventType.CHECK_IN:
+                punct = ev.punctuality_status.display_vi
+                late_txt = f" ({ev.late_minutes} phút)" if ev.late_minutes else ""
+                self._var_last_punctuality.set(f"{punct}{late_txt}")
+            else:
+                self._var_last_punctuality.set("—")
+
+            self._var_last_device.set(ev.camera_id)
+            self._var_last_method.set(ev.verify_method)
+            self._var_last_vstatus.set(ev.verify_status)
+            self._var_last_result.set(ev.result)
+            self._var_last_record_id.set(str(ev.event_id))
 
             # Thống kê
             self._var_total.set(str(self._attendance.total_events))

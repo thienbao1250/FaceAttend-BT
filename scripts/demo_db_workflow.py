@@ -27,6 +27,8 @@ from app.database.connection import get_session, create_all_tables, ping_databas
 from app.database.repositories.employee_repo import EmployeeRepository
 from app.database.repositories.face_template_repo import FaceTemplateRepository
 from app.database.repositories.attendance_repo import AttendanceRepository
+from app.database.repositories.face_recognition_log_repo import FaceRecognitionLogRepository
+from app.database.repositories.attendance_record_repo import AttendanceRecordRepository
 from app.vision.face_matcher import FaceGallery, FaceMatcher, MatchStatus
 
 
@@ -48,6 +50,8 @@ def main():
         emp_repo = EmployeeRepository(session)
         tpl_repo = FaceTemplateRepository(session)
         att_repo = AttendanceRepository(session)
+        log_repo = FaceRecognitionLogRepository(session)
+        rec_repo = AttendanceRecordRepository(session)
 
         # Tạo camera mặc định nếu chưa có
         from app.database.models import Camera
@@ -120,8 +124,28 @@ def main():
 
         if match_res.status == MatchStatus.KNOWN:
             emp_matched_id = int(match_res.employee_id)
+
+            # A. Ghi FaceRecognitionLog (log kỹ thuật)
+            recog_log = log_repo.record_recognition(
+                timestamp=now,
+                result="SUCCESS",
+                employee_id=emp_matched_id,
+                camera_id=cam.id,
+                confidence=match_res.similarity,
+            )
+
+            # B. Ghi AttendanceRecord (bản ghi chính thức theo ngày)
+            att_rec = rec_repo.upsert_check_in(
+                employee_id=emp_matched_id,
+                check_in=now,
+                camera_id=cam.id,
+                confidence=match_res.similarity,
+                punctuality_status="ON_TIME",
+                late_minutes=0,
+                device_id=cam.camera_code,
+            )
             
-            # Ghi nhận Check-in
+            # Ghi nhận Check-in (attendance_events)
             ev1 = att_repo.record_event(
                 employee_id=emp_matched_id,
                 event_type="check_in",
@@ -131,13 +155,22 @@ def main():
                 note="Nhận diện tự động cổng chính"
             )
             session.commit()
+            print(f"  [DB]: Ghi FaceRecognitionLog (LogId={recog_log.id}, Result={recog_log.result})")
+            print(f"  [DB]: Ghi AttendanceRecord (AttendanceId={att_rec.id}, Status={att_rec.attendance_status}, Punctuality={att_rec.punctuality_status})")
             print(f"  [DB]: Ghi nhận CHECK-IN thành công (Event ID={ev1.id}) lúc {ev1.event_time.strftime('%H:%M:%S UTC')}")
 
             # Thử ghi nhận check-out sau 8 tiếng
+            t_out = now + timedelta(hours=8)
+            rec_repo.upsert_check_out(
+                employee_id=emp_matched_id,
+                check_out=t_out,
+                camera_id=cam.id,
+                confidence=match_res.similarity,
+            )
             ev2 = att_repo.record_event(
                 employee_id=emp_matched_id,
                 event_type="check_out",
-                event_time=now + timedelta(hours=8),
+                event_time=t_out,
                 confidence=match_res.similarity,
                 camera_id=cam.id,
                 note="Nhận diện tự động lúc tan ca"

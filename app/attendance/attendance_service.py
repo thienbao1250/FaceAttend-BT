@@ -1,6 +1,6 @@
 """
 app/attendance/attendance_service.py
-Logic chấm công — Giai đoạn 8.
+Logic chấm công — Giai đoạn 10.
 
 Chuyển kết quả nhận diện khuôn mặt (MatchResult) thành sự kiện chấm công
 (AttendanceEvent) theo quy tắc nghiệp vụ.
@@ -15,7 +15,6 @@ Quy tắc cốt lõi:
        Lần nhận diện hợp lệ đầu tiên trong ngày → CHECK_IN.
        Lần hợp lệ tiếp theo sau ít nhất MIN_TOGGLE_SECONDS → CHECK_OUT.
        Tiếp tục luân phiên IN/OUT.
-       (Logic này sẽ được tinh chỉnh theo ca làm việc ở Giai đoạn 9+.)
 
   3. Chỉ xử lý kết quả KNOWN:
        UNCERTAIN và UNKNOWN không tạo sự kiện; thay vào đó trả về reason
@@ -25,9 +24,13 @@ Quy tắc cốt lõi:
        Toàn bộ timestamp lưu dưới dạng float (epoch seconds, UTC).
        Helper to_local_dt() chuyển sang múi giờ cấu hình.
 
+  5. Trạng thái điểm danh (Giai đoạn 10):
+       PunctualityStatus: ON_TIME (đúng giờ) | LATE (trễ giờ) | EARLY_LEAVE | UNKNOWN
+       Tính dựa vào giờ bắt đầu ca (shift_start_hour) và ngưỡng trễ (late_threshold_minutes).
+
 Thiết kế:
   - Không phụ thuộc camera hay UI; nhận MatchResult + timestamp.
-  - Lịch sử sự kiện hiện tại lưu in-memory (list); Giai đoạn 9 thay bằng DB.
+  - Lịch sử sự kiện hiện tại lưu in-memory (list); dùng DB repo ở Giai đoạn 9+.
   - Có thể export lịch sử ra file JSON/CSV để kiểm tra khi chưa có DB.
 """
 
@@ -38,8 +41,9 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from app.vision.face_matcher import MatchResult, MatchStatus
@@ -61,6 +65,20 @@ DEFAULT_MIN_TOGGLE_SECONDS: float = 60.0
 # Múi giờ hiển thị mặc định (UTC+7 — Hà Nội / Tp.HCM)
 DEFAULT_TIMEZONE = timezone(timedelta(hours=7))
 
+# Giờ bắt đầu ca mặc định (8:00 sáng)
+DEFAULT_SHIFT_START_HOUR: int = 8
+DEFAULT_SHIFT_START_MINUTE: int = 0
+
+# Giờ kết thúc ca mặc định (17:00 chiều)
+DEFAULT_SHIFT_END_HOUR: int = 17
+DEFAULT_SHIFT_END_MINUTE: int = 0
+
+# Ngưỡng trễ: check-in muộn hơn giờ ca bao nhiêu phút thì coi là LATE
+DEFAULT_LATE_THRESHOLD_MINUTES: int = 5
+
+# Ngưỡng về sớm: check-out sớm hơn cuối ca bao nhiêu phút thì coi là EARLY_LEAVE
+DEFAULT_EARLY_LEAVE_THRESHOLD_MINUTES: int = 5
+
 
 # ---------------------------------------------------------------------------
 # Enum kiểu sự kiện chấm công
@@ -69,6 +87,27 @@ DEFAULT_TIMEZONE = timezone(timedelta(hours=7))
 class EventType(Enum):
     CHECK_IN  = "check_in"   # Lượt vào (lần nhận diện hợp lệ đầu)
     CHECK_OUT = "check_out"  # Lượt ra (lần nhận diện hợp lệ tiếp theo)
+
+
+# ---------------------------------------------------------------------------
+# Enum trạng thái đúng/trễ giờ (Giai đoạn 10)
+# ---------------------------------------------------------------------------
+
+class PunctualityStatus(Enum):
+    ON_TIME     = "ON_TIME"      # Đúng giờ — check-in <= shift_start + late_threshold
+    LATE        = "LATE"         # Trễ giờ   — check-in >  shift_start + late_threshold
+    EARLY_LEAVE = "EARLY_LEAVE"  # Về sớm    — check-out < shift_end   - early_leave_threshold
+    UNKNOWN     = "UNKNOWN"      # Không xác định (chưa có đủ dữ liệu ca)
+
+    @property
+    def display_vi(self) -> str:
+        """Nhãn tiếng Việt để hiển thị UI."""
+        return {
+            "ON_TIME":     "✅ Đúng giờ",
+            "LATE":        "⚠️  Trễ giờ",
+            "EARLY_LEAVE": "⏰ Về sớm",
+            "UNKNOWN":     "—  Không rõ",
+        }[self.value]
 
 
 # ---------------------------------------------------------------------------
@@ -92,20 +131,29 @@ class AttendanceEvent:
     Một sự kiện chấm công (check-in hoặc check-out).
 
     Thuộc tính:
-        event_id      : ID tăng dần trong phiên (thay bằng UUID khi có DB)
-        employee_id   : mã nhân viên
-        event_type    : CHECK_IN hoặc CHECK_OUT
-        timestamp_utc : thời điểm sự kiện (epoch seconds, UTC)
-        camera_id     : ID camera ghi nhận (chuỗi tự do)
-        similarity    : cosine similarity tại thời điểm nhận diện
-        confidence    : độ tin cậy sự kiện (thường = similarity)
+        event_id           : ID tăng dần trong phiên (thay bằng UUID khi có DB)
+        employee_id        : mã nhân viên
+        event_type         : CHECK_IN hoặc CHECK_OUT
+        timestamp_utc      : thời điểm sự kiện (epoch seconds, UTC)
+        camera_id          : ID camera ghi nhận (chuỗi tự do)
+        similarity         : cosine similarity tại thời điểm nhận diện
+        punctuality_status : trạng thái đúng/trễ giờ (Giai đoạn 10)
+        late_minutes       : số phút đi trễ (0 nếu đúng giờ, None nếu không xác định)
+        verify_method      : phương thức điểm danh (Face Recognition, Manual, Card)
+        verify_status      : trạng thái xác minh (Success, Failed, Disputed)
+        result             : kết quả (Accepted, Rejected, Pending)
     """
-    event_id:      int
-    employee_id:   str
-    event_type:    EventType
-    timestamp_utc: float
-    camera_id:     str   = "cam_0"
-    similarity:    float = 0.0
+    event_id:           int
+    employee_id:        str
+    event_type:         EventType
+    timestamp_utc:      float
+    camera_id:          str                = "cam_0"
+    similarity:         float              = 0.0
+    punctuality_status: PunctualityStatus  = PunctualityStatus.UNKNOWN
+    late_minutes:       Optional[int]      = None
+    verify_method:      str                = "Face Recognition"
+    verify_status:      str                = "Success"
+    result:             str                = "Accepted"
 
     def to_local_dt(self, tz: timezone = DEFAULT_TIMEZONE) -> datetime:
         """Chuyển timestamp UTC sang datetime theo múi giờ cấu hình."""
@@ -113,23 +161,57 @@ class AttendanceEvent:
 
     def __str__(self) -> str:
         dt = self.to_local_dt()
+        punctuality = self.punctuality_status.display_vi if self.event_type == EventType.CHECK_IN else ""
         return (
             f"[{self.event_type.value.upper()}] "
             f"{self.employee_id} | "
             f"{dt.strftime('%Y-%m-%d %H:%M:%S')} | "
             f"sim={self.similarity:.3f} | "
             f"cam={self.camera_id}"
+            + (f" | {punctuality}" if punctuality else "")
         )
 
     def to_dict(self) -> dict:
         return {
-            "event_id":      self.event_id,
-            "employee_id":   self.employee_id,
-            "event_type":    self.event_type.value,
-            "timestamp_utc": self.timestamp_utc,
-            "timestamp_local": self.to_local_dt().isoformat(),
-            "camera_id":     self.camera_id,
-            "similarity":    round(self.similarity, 4),
+            "event_id":           self.event_id,
+            "employee_id":        self.employee_id,
+            "event_type":         self.event_type.value,
+            "timestamp_utc":      self.timestamp_utc,
+            "timestamp_local":    self.to_local_dt().isoformat(),
+            "camera_id":          self.camera_id,
+            "similarity":         round(self.similarity, 4),
+            "punctuality_status": self.punctuality_status.value,
+            "late_minutes":       self.late_minutes,
+            "verify_method":      self.verify_method,
+            "verify_status":      self.verify_status,
+            "result":             self.result,
+        }
+
+    def to_display_dict(self, employee_code: str = "") -> dict:
+        """
+        Trả về dict theo cấu trúc hiển thị nghiệp vụ chuẩn:
+
+        Employee ID    : FA-IT-2026-0001
+        Thời gian      : 2026-11-26 08:05:30
+        Device ID      : cam_0
+        Phương thức    : Face Recognition
+        Event Type     : Check-in
+        Verify Status  : Success
+        Result         : Accepted
+        Record ID      : 100001
+        """
+        dt = self.to_local_dt()
+        return {
+            "Employee ID":   employee_code or self.employee_id,
+            "Thời gian":     dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "Device ID":     self.camera_id,
+            "Phương thức":   self.verify_method,
+            "Event Type":    "Check-in" if self.event_type == EventType.CHECK_IN else "Check-out",
+            "Verify Status": self.verify_status,
+            "Result":        self.result,
+            "Record ID":     self.event_id,
+            "Trạng thái":    self.punctuality_status.display_vi,
+            "Đi trễ (phút)": self.late_minutes if self.late_minutes is not None else "—",
         }
 
 
@@ -180,9 +262,15 @@ class AttendanceService:
     Áp dụng quy tắc nghiệp vụ chấm công vào kết quả nhận diện khuôn mặt.
 
     Tham số khởi tạo:
-        cooldown_seconds    : Giây chờ tối thiểu giữa hai sự kiện cùng người/camera
-        min_toggle_seconds  : Giây tối thiểu để chuyển từ CHECK_IN → CHECK_OUT
-        display_tz          : Múi giờ dùng cho hiển thị (không ảnh hưởng lưu trữ)
+        cooldown_seconds              : Giây chờ tối thiểu giữa hai sự kiện cùng người/camera
+        min_toggle_seconds            : Giây tối thiểu để chuyển từ CHECK_IN → CHECK_OUT
+        display_tz                    : Múi giờ dùng cho hiển thị (không ảnh hưởng lưu trữ)
+        shift_start_hour              : Giờ bắt đầu ca (mặc định 8)
+        shift_start_minute            : Phút bắt đầu ca (mặc định 0)
+        shift_end_hour                : Giờ kết thúc ca (mặc định 17)
+        shift_end_minute              : Phút kết thúc ca (mặc định 0)
+        late_threshold_minutes        : Trễ bao nhiêu phút thì coi là LATE (mặc định 5)
+        early_leave_threshold_minutes : Về sớm bao nhiêu phút thì coi là EARLY_LEAVE (mặc định 5)
 
     Ví dụ sử dụng::
 
@@ -190,20 +278,34 @@ class AttendanceService:
         decision = service.process(match_result, camera_id="cam_main")
 
         if decision.created:
-            print(decision.event)      # [CHECK_IN] EMP001 | 2026-11-13 08:05:12 ...
+            print(decision.event)      # [CHECK_IN] EMP001 | 2026-11-13 08:05:12 ... | ⚠️  Trễ giờ
         else:
             print(decision.message)    # Cooldown: còn 25.3 giây
     """
 
     def __init__(
         self,
-        cooldown_seconds:   float    = DEFAULT_COOLDOWN_SECONDS,
-        min_toggle_seconds: float    = DEFAULT_MIN_TOGGLE_SECONDS,
-        display_tz:         timezone = DEFAULT_TIMEZONE,
+        cooldown_seconds:              float    = DEFAULT_COOLDOWN_SECONDS,
+        min_toggle_seconds:            float    = DEFAULT_MIN_TOGGLE_SECONDS,
+        display_tz:                    timezone = DEFAULT_TIMEZONE,
+        shift_start_hour:              int      = DEFAULT_SHIFT_START_HOUR,
+        shift_start_minute:            int      = DEFAULT_SHIFT_START_MINUTE,
+        shift_end_hour:                int      = DEFAULT_SHIFT_END_HOUR,
+        shift_end_minute:              int      = DEFAULT_SHIFT_END_MINUTE,
+        late_threshold_minutes:        int      = DEFAULT_LATE_THRESHOLD_MINUTES,
+        early_leave_threshold_minutes: int      = DEFAULT_EARLY_LEAVE_THRESHOLD_MINUTES,
     ) -> None:
         self._cooldown    = cooldown_seconds
         self._min_toggle  = min_toggle_seconds
         self._display_tz  = display_tz
+
+        # Cấu hình ca làm việc
+        self._shift_start_hour              = shift_start_hour
+        self._shift_start_minute            = shift_start_minute
+        self._shift_end_hour                = shift_end_hour
+        self._shift_end_minute              = shift_end_minute
+        self._late_threshold_minutes        = late_threshold_minutes
+        self._early_leave_threshold_minutes = early_leave_threshold_minutes
 
         # Trạng thái theo dõi: (employee_id, camera_id) → _EmployeeState
         self._states: dict[tuple[str, str], _EmployeeState] = {}
@@ -295,6 +397,12 @@ class AttendanceService:
             event_type = next_type
 
         # --- Bước 4: Tạo sự kiện ---
+        # Tính trạng thái đúng/trễ giờ cho CHECK_IN
+        punctuality = PunctualityStatus.UNKNOWN
+        late_minutes: Optional[int] = None
+        if event_type == EventType.CHECK_IN:
+            punctuality, late_minutes = self._compute_punctuality(now)
+
         event = AttendanceEvent(
             event_id=self._next_event_id,
             employee_id=emp_id,
@@ -302,6 +410,8 @@ class AttendanceService:
             timestamp_utc=now,
             camera_id=camera_id,
             similarity=match_result.similarity,
+            punctuality_status=punctuality,
+            late_minutes=late_minutes,
         )
         self._events.append(event)
         self._next_event_id += 1
@@ -316,6 +426,42 @@ class AttendanceService:
             event=event,
             message=str(event),
         )
+
+    # ------------------------------------------------------------------
+    # Tính trạng thái đúng/trễ giờ
+    # ------------------------------------------------------------------
+
+    def _compute_punctuality(
+        self, timestamp_utc: float
+    ) -> tuple["PunctualityStatus", Optional[int]]:
+        """
+        Tính PunctualityStatus và số phút trễ cho một thời điểm check-in.
+
+        Logic:
+          - Chuyển timestamp UTC sang local timezone
+          - So sánh giờ check-in với giờ bắt đầu ca + ngưỡng trễ
+          - Nếu check-in <= shift_start + late_threshold → ON_TIME
+          - Nếu check-in >  shift_start + late_threshold → LATE, tính phút trễ
+
+        Trả về: (PunctualityStatus, late_minutes_or_None)
+        """
+        checkin_local = datetime.fromtimestamp(timestamp_utc, tz=self._display_tz)
+        # Giờ bắt đầu ca trong cùng ngày (local)
+        shift_start_local = checkin_local.replace(
+            hour=self._shift_start_hour,
+            minute=self._shift_start_minute,
+            second=0,
+            microsecond=0,
+        )
+        # Ngưỡng: shift_start + late_threshold
+        threshold_local = shift_start_local + timedelta(minutes=self._late_threshold_minutes)
+
+        if checkin_local <= threshold_local:
+            return PunctualityStatus.ON_TIME, 0
+        else:
+            diff = checkin_local - shift_start_local
+            late_mins = int(diff.total_seconds() / 60)
+            return PunctualityStatus.LATE, late_mins
 
     # ------------------------------------------------------------------
     # Truy vấn lịch sử
@@ -408,35 +554,92 @@ class AttendanceService:
         logger.info("AttendanceService.clear_history: đã xóa lịch sử.")
 
     # ------------------------------------------------------------------
-    # Export (tạm thời trước khi có DB)
+    # Export & Lưu trữ phân cấp theo Năm / Tháng / Ngày
     # ------------------------------------------------------------------
 
-    def export_json(self, filepath: str) -> None:
+    @staticmethod
+    def get_daily_dir(base_dir: str | Path, target_date: date) -> Path:
         """
-        Xuất toàn bộ lịch sử sự kiện ra file JSON.
-        Dùng để kiểm tra khi chưa có Database.
+        Trả về thư mục lưu trữ phân cấp theo năm → tháng → ngày:
+            <base_dir>/YYYY/MM/DD
+        Ví dụ: data/attendance/2026/11/26
         """
-        import pathlib
-        pathlib.Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump([e.to_dict() for e in self._events], f, ensure_ascii=False, indent=2)
-        logger.info("AttendanceService.export_json: %d sự kiện → %s", len(self._events), filepath)
+        return (
+            Path(base_dir)
+            / f"{target_date.year:04d}"
+            / f"{target_date.month:02d}"
+            / f"{target_date.day:02d}"
+        )
 
-    def export_csv(self, filepath: str) -> None:
+    def export_json(self, filepath: str, events: Optional[list[AttendanceEvent]] = None) -> None:
         """
-        Xuất toàn bộ lịch sử sự kiện ra file CSV.
+        Xuất lịch sử sự kiện ra file JSON (bao gồm thông tin điểm danh & trạng thái).
         """
-        import pathlib
-        pathlib.Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = ["event_id", "employee_id", "event_type",
-                      "timestamp_local", "timestamp_utc", "camera_id", "similarity"]
+        target_events = self._events if events is None else events
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump([e.to_dict() for e in target_events], f, ensure_ascii=False, indent=2)
+        logger.info("AttendanceService.export_json: %d sự kiện → %s", len(target_events), filepath)
+
+    def export_csv(self, filepath: str, events: Optional[list[AttendanceEvent]] = None) -> None:
+        """
+        Xuất lịch sử sự kiện ra file CSV.
+        """
+        target_events = self._events if events is None else events
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "event_id", "employee_id", "event_type",
+            "timestamp_local", "timestamp_utc", "camera_id", "similarity",
+            "punctuality_status", "late_minutes",
+            "verify_method", "verify_status", "result",
+        ]
         with open(filepath, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            for e in self._events:
+            for e in target_events:
                 row = e.to_dict()
                 writer.writerow({k: row[k] for k in fieldnames})
-        logger.info("AttendanceService.export_csv: %d sự kiện → %s", len(self._events), filepath)
+        logger.info("AttendanceService.export_csv: %d sự kiện → %s", len(target_events), filepath)
+
+    def export_by_date(
+        self,
+        base_dir: str | Path,
+        tz: Optional[timezone] = None,
+        target_date: Optional[date] = None,
+    ) -> list[Path]:
+        """
+        Xuất dữ liệu điểm danh phân rõ theo từng ngày:
+            <base_dir>/YYYY/MM/DD/attendance.json
+            <base_dir>/YYYY/MM/DD/attendance.csv
+
+        Nếu danh sách sự kiện trống và có target_date (hoặc mặc định hôm nay),
+        vẫn tạo thư mục ngày với file rỗng để đảm bảo cấu trúc lưu trữ theo ngày.
+        Trả về danh sách các thư mục ngày đã ghi.
+        """
+        use_tz = tz or self._display_tz
+        grouped: dict[date, list[AttendanceEvent]] = {}
+        for ev in self._events:
+            ev_date = ev.to_local_dt(use_tz).date()
+            grouped.setdefault(ev_date, []).append(ev)
+
+        if not grouped:
+            fallback_date = target_date or datetime.now(use_tz).date()
+            grouped[fallback_date] = []
+
+        written_dirs: list[Path] = []
+        for day in sorted(grouped):
+            day_dir = self.get_daily_dir(base_dir, day)
+            day_dir.mkdir(parents=True, exist_ok=True)
+            day_events = grouped[day]
+            self.export_json(str(day_dir / "attendance.json"), events=day_events)
+            self.export_csv(str(day_dir / "attendance.csv"), events=day_events)
+            written_dirs.append(day_dir)
+
+        logger.info(
+            "AttendanceService.export_by_date: đã xuất %d ngày vào %s",
+            len(written_dirs), base_dir,
+        )
+        return written_dirs
 
     def print_summary(self) -> None:
         """In tóm tắt lịch sử ra console (debug / demo)."""

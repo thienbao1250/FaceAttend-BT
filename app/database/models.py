@@ -1,31 +1,39 @@
 """
 app/database/models.py
-SQLAlchemy ORM models — Giai đoạn 9.
+SQLAlchemy ORM models — Giai đoạn 10.
 
 Ánh xạ trực tiếp từ ERD đã thiết kế:
-  - employees          : thông tin nhân viên
-  - face_templates     : embedding khuôn mặt (binary bytea/BLOB)
-  - cameras            : thông tin camera
-  - attendance_events  : sự kiện check-in / check-out
-  - users              : tài khoản quản trị
-  - roles              : vai trò và quyền
-  - audit_logs         : nhật ký thao tác
+  - employees              : thông tin nhân viên
+  - face_templates         : embedding khuôn mặt (binary bytea/BLOB)
+  - cameras                : thông tin camera
+  - face_recognition_logs  : log kỹ thuật mỗi lần camera nhận diện
+  - attendance_events      : sự kiện check-in / check-out (legacy / realtime)
+  - attendance_records     : bản ghi chính thức chấm công theo ngày
+  - users                  : tài khoản quản trị
+  - roles                  : vai trò và quyền
+  - audit_logs             : nhật ký thao tác
 
 Lưu ý bảo mật:
   - Cột `embedding` lưu dạng LargeBinary (bytea/BLOB) — không log giá trị này.
   - Cột `password_hash` trong users — không log giá trị này.
   - audit_logs.old_value / new_value KHÔNG được chứa embedding thô.
+
+Chính sách lưu trữ (theo đề xuất nghiệp vụ):
+  - Log nhận diện thành công  : giữ 30–90 ngày
+  - Log nhận diện thất bại    : giữ 7–30 ngày
+  - Ảnh chụp sự kiện          : giữ 7–30 ngày nếu cần
+  - Bản ghi chấm công chính   : theo quy định pháp luật
+  - Face Embedding            : trong thời gian còn mục đích nhận diện
 """
 
 from __future__ import annotations
 
-import struct
-from datetime import datetime, timezone
+from datetime import date as date_type, datetime, timezone
 from typing import Optional
 
 import numpy as np
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Float, ForeignKey,
+    BigInteger, Boolean, Date, DateTime, Float, ForeignKey,
     Index, Integer, LargeBinary, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -160,6 +168,12 @@ class Employee(Base):
     attendance_events: Mapped[list["AttendanceEvent"]] = relationship(
         "AttendanceEvent", back_populates="employee"
     )
+    face_recognition_logs: Mapped[list["FaceRecognitionLog"]] = relationship(
+        "FaceRecognitionLog", back_populates="employee"
+    )
+    attendance_records: Mapped[list["AttendanceRecord"]] = relationship(
+        "AttendanceRecord", back_populates="employee"
+    )
 
     # Index
     __table_args__ = (
@@ -280,6 +294,9 @@ class Camera(Base):
     attendance_events: Mapped[list["AttendanceEvent"]] = relationship(
         "AttendanceEvent", back_populates="camera"
     )
+    face_recognition_logs: Mapped[list["FaceRecognitionLog"]] = relationship(
+        "FaceRecognitionLog", back_populates="camera"
+    )
 
     def __repr__(self) -> str:
         return f"<Camera id={self.id} code={self.camera_code!r} location={self.location!r} status={self.status}>"
@@ -358,7 +375,11 @@ class AuditLog(Base):
     """
     __tablename__ = "audit_logs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
     user_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
         comment="NULL nếu action từ system/scheduler"
@@ -395,4 +416,301 @@ class AuditLog(Base):
         return (
             f"<AuditLog id={self.id} action={self.action!r} "
             f"table={self.target_table!r} target_id={self.target_id} user_id={self.user_id}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Model: face_recognition_logs  (Log kỹ thuật — Giai đoạn 10)
+# ---------------------------------------------------------------------------
+
+class FaceRecognitionLog(Base):
+    """
+    Log kỹ thuật — ghi lại MỖI LẦN camera thực hiện nhận diện khuôn mặt.
+
+    Khác với attendance_events (chỉ ghi sự kiện được chấp nhận),
+    bảng này ghi TẤT CẢ: thành công, thất bại, uncertainty.
+
+    Chính sách lưu trữ đề xuất:
+      - Kết quả SUCCESS  : giữ 30–90 ngày
+      - Kết quả FAILURE  : giữ 7–30 ngày
+      - Ảnh sự kiện      : giữ 7–30 ngày nếu thực sự cần, có chính sách bảo vệ
+    """
+    __tablename__ = "face_recognition_logs"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+        comment="LogId — tăng dần, VD: 10001"
+    )
+    employee_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True,
+        comment="NULL nếu nhận diện thất bại (UNKNOWN / UNCERTAIN)"
+    )
+    camera_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True
+    )
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        comment="Thời điểm nhận diện — lưu UTC (VD: 08:00:15)"
+    )
+    confidence: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Cosine similarity / confidence score (0.0–1.0), VD: 0.95"
+    )
+    result: Mapped[str] = mapped_column(
+        String(20), nullable=False,
+        comment="SUCCESS | FAILURE | UNCERTAIN"
+    )
+    failure_reason: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Lý do thất bại nếu result != SUCCESS, VD: LOW_QUALITY, UNKNOWN_FACE"
+    )
+    event_snapshot_path: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True,
+        comment="Đường dẫn ảnh chụp sự kiện (nếu bật chụp). "
+                "Chỉ lưu khi thực sự cần và có chính sách bảo vệ phù hợp. "
+                "Xóa sau 7–30 ngày theo policy."
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Thời điểm hết hạn lưu trữ (scheduler sẽ xóa sau thời hạn này)"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    # Relationships
+    employee: Mapped[Optional["Employee"]] = relationship(
+        "Employee", back_populates="face_recognition_logs"
+    )
+    camera: Mapped[Optional["Camera"]] = relationship(
+        "Camera", back_populates="face_recognition_logs"
+    )
+
+    # Indexes
+    __table_args__ = (
+        Index("ix_frl_timestamp", "timestamp"),
+        Index("ix_frl_employee_time", "employee_id", "timestamp"),
+        Index("ix_frl_result", "result"),
+        Index("ix_frl_expires_at", "expires_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaceRecognitionLog id={self.id} emp={self.employee_id} "
+            f"result={self.result!r} ts={self.timestamp} conf={self.confidence}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Model: attendance_records  (Bản ghi chính thức — Giai đoạn 10)
+# ---------------------------------------------------------------------------
+
+class AttendanceRecord(Base):
+    """
+    Bản ghi chấm công CHÍNH THỨC theo ngày.
+
+    Chỉ lưu những sự kiện được hệ thống chấp nhận là chấm công hợp lệ.
+    Đây là bảng quan trọng nhất để tính công, báo cáo, và tuân thủ pháp luật.
+
+    Cấu trúc lưu trữ: phân rõ theo WorkDate (năm → tháng → ngày),
+    cho phép query nhanh theo khoảng thời gian bất kỳ.
+
+    Trường attendance_status (đúng giờ / trễ giờ):
+      - ON_TIME  : check-in <= work_start_time + late_threshold
+      - LATE     : check-in > work_start_time + late_threshold
+      - ABSENT   : không có check-in trong ngày
+      - HALF_DAY : chỉ làm nửa ca
+
+    Chính sách lưu trữ: theo thời hạn pháp luật hoặc thỏa thuận công ty.
+    """
+    __tablename__ = "attendance_records"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+        comment="AttendanceId — tăng dần, VD: 10001"
+    )
+    employee_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("employees.id", ondelete="RESTRICT"), nullable=False,
+        comment="Không xóa cascade — giữ lịch sử dù nhân viên bị xóa"
+    )
+    work_date: Mapped["date_type"] = mapped_column(
+        Date, nullable=False,
+        comment="Ngày làm việc (YYYY-MM-DD). Phân cấp: năm → tháng → ngày"
+    )
+
+    # --- Thông tin check-in ---
+    check_in: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Thời điểm check-in — UTC (VD: 08:00:15)"
+    )
+    check_in_camera_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True
+    )
+    check_in_confidence: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Confidence khi check-in (0.0–1.0)"
+    )
+
+    # --- Thông tin check-out ---
+    check_out: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Thời điểm check-out — UTC (VD: 17:05:20)"
+    )
+    check_out_camera_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True
+    )
+    check_out_confidence: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Confidence khi check-out (0.0–1.0)"
+    )
+
+    # --- Trạng thái điểm danh ---
+    attendance_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="PRESENT",
+        comment="PRESENT | ABSENT | LATE | HALF_DAY | HOLIDAY | LEAVE"
+    )
+    punctuality_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ON_TIME",
+        comment="Trạng thái đúng/trễ giờ: ON_TIME | LATE | EARLY_LEAVE | UNKNOWN"
+    )
+    late_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Số phút đi trễ (0 nếu đúng giờ, NULL nếu không xác định)"
+    )
+    early_leave_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Số phút về sớm (0 nếu đúng giờ, NULL nếu không xác định)"
+    )
+    work_minutes: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Tổng số phút làm việc (check_out - check_in). NULL nếu chưa check-out"
+    )
+
+    # --- Thông tin ca làm việc ---
+    shift_start: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Giờ bắt đầu ca quy định — UTC"
+    )
+    shift_end: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Giờ kết thúc ca quy định — UTC"
+    )
+
+    # --- Phương thức và xác minh ---
+    verify_method: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="Face Recognition",
+        comment="Phương thức điểm danh: Face Recognition | Manual | Card"
+    )
+    verify_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="Success",
+        comment="Success | Failed | Disputed"
+    )
+    result: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="Accepted",
+        comment="Accepted | Rejected | Pending"
+    )
+    device_id: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="ID thiết bị/camera ghi nhận"
+    )
+    record_source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="auto",
+        comment="auto (nhận diện tự động) | manual (admin nhập tay) | corrected (đã chỉnh)"
+    )
+
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    # Relationships
+    employee: Mapped["Employee"] = relationship(
+        "Employee", back_populates="attendance_records"
+    )
+    check_in_camera: Mapped[Optional["Camera"]] = relationship(
+        "Camera", foreign_keys=[check_in_camera_id]
+    )
+    check_out_camera: Mapped[Optional["Camera"]] = relationship(
+        "Camera", foreign_keys=[check_out_camera_id]
+    )
+
+    # Indexes — phân cấp theo năm/tháng/ngày (work_date)
+    __table_args__ = (
+        # Đảm bảo mỗi nhân viên chỉ có 1 bản ghi chính thức mỗi ngày
+        UniqueConstraint("employee_id", "work_date", name="uq_attendance_emp_date"),
+        # Query nhanh theo ngày làm việc (toàn công ty)
+        Index("ix_attendance_records_work_date", "work_date"),
+        # Query lịch sử theo nhân viên + ngày
+        Index("ix_attendance_records_emp_date", "employee_id", "work_date"),
+        # Query theo trạng thái
+        Index("ix_attendance_records_status", "attendance_status"),
+        Index("ix_attendance_records_punctuality", "punctuality_status"),
+    )
+
+    def to_display_dict(
+        self,
+        tz_offset_hours: int = 7,
+        employee_code: Optional[str] = None,
+        event_type: str = "Check-in",
+    ) -> dict:
+        """
+        Trả về dict hiển thị theo cấu trúc nghiệp vụ chuẩn.
+        Dữ liệu hiển thị theo múi giờ local (mặc định GMT+7).
+
+        Ví dụ cấu trúc trả về:
+            Employee ID    : FA-IT-2026-0001
+            Thời gian      : 2026-11-26 08:05:30
+            Device ID      : CAM001
+            Phương thức    : Face Recognition
+            Event Type     : Check-in
+            Verify Status  : Success
+            Result         : Accepted
+            Record ID      : 100001
+        """
+        from datetime import timedelta
+        tz = timezone(timedelta(hours=tz_offset_hours))
+
+        def _fmt(dt: Optional[datetime]) -> Optional[str]:
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+        emp_display = (
+            employee_code
+            or (self.employee.employee_code if self.employee is not None else str(self.employee_id))
+        )
+        event_dt = self.check_out if event_type.lower() == "check-out" and self.check_out else self.check_in
+
+        return {
+            "Record ID":     self.id,
+            "Employee ID":   emp_display,
+            "Work Date":     str(self.work_date),
+            "Thời gian":     _fmt(event_dt),
+            "Device ID":     self.device_id,
+            "Phương thức":   self.verify_method,
+            "Event Type":    event_type,
+            "Verify Status": self.verify_status,
+            "Result":        self.result,
+            "Check-in":      _fmt(self.check_in),
+            "Check-out":     _fmt(self.check_out),
+            "Trạng thái":    self.attendance_status,
+            "Punctuality":   self.punctuality_status,
+            "Đi trễ (phút)": self.late_minutes,
+            "Làm (phút)":   self.work_minutes,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"<AttendanceRecord id={self.id} emp={self.employee_id} "
+            f"date={self.work_date} status={self.attendance_status!r} "
+            f"punctuality={self.punctuality_status!r}>"
         )

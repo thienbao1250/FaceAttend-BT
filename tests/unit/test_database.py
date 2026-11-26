@@ -438,3 +438,236 @@ class TestAttendanceRepository:
         today_local = date_type.today()
         events = repo.list_by_date(today_local, tz_offset_hours=7)
         assert any(e.employee_id == emp.id for e in events)
+
+
+# ===========================================================================
+# Tests: FaceRecognitionLogRepository — Giai đoạn 10
+# ===========================================================================
+
+class TestFaceRecognitionLogRepository:
+
+    def _emp(self, session, code="LOG_EMP_01"):
+        from app.database.repositories.employee_repo import EmployeeRepository
+        repo = EmployeeRepository(session)
+        emp = repo.create(code, f"Nhân viên {code}")
+        session.commit()
+        return emp
+
+    def _cam(self, session, code="CAM001"):
+        from app.database.models import Camera
+        cam = Camera(camera_code=code, name="Cổng chính", status="online")
+        session.add(cam)
+        session.commit()
+        return cam
+
+    def _repo(self, session):
+        from app.database.repositories.face_recognition_log_repo import FaceRecognitionLogRepository
+        return FaceRecognitionLogRepository(session)
+
+    def test_record_success_log(self, db_session):
+        emp = self._emp(db_session)
+        cam = self._cam(db_session)
+        repo = self._repo(db_session)
+        now = datetime.now(timezone.utc)
+        log = repo.record_recognition(
+            timestamp=now,
+            result="SUCCESS",
+            employee_id=emp.id,
+            camera_id=cam.id,
+            confidence=0.95,
+        )
+        db_session.commit()
+        assert log.id is not None
+        assert log.result == "SUCCESS"
+        assert log.failure_reason is None
+        assert log.confidence == pytest.approx(0.95)
+        assert log.expires_at is not None
+
+    def test_record_failure_log_with_null_employee(self, db_session):
+        cam = self._cam(db_session, "CAM002")
+        repo = self._repo(db_session)
+        now = datetime.now(timezone.utc)
+        log = repo.record_recognition(
+            timestamp=now,
+            result="FAILURE",
+            employee_id=None,
+            camera_id=cam.id,
+            confidence=0.12,
+            failure_reason="UNKNOWN_FACE",
+        )
+        db_session.commit()
+        assert log.id is not None
+        assert log.employee_id is None
+        assert log.result == "FAILURE"
+        assert log.failure_reason == "UNKNOWN_FACE"
+
+    def test_retention_policy_success_vs_failure(self, db_session):
+        from app.database.repositories.face_recognition_log_repo import (
+            LOG_SUCCESS_RETENTION_DAYS,
+            LOG_FAILURE_RETENTION_DAYS,
+        )
+        emp = self._emp(db_session, "LOG_EMP_02")
+        repo = self._repo(db_session)
+        now = datetime(2026, 11, 26, 8, 0, 0, tzinfo=timezone.utc)
+        log_ok = repo.record_recognition(timestamp=now, result="SUCCESS", employee_id=emp.id)
+        log_fail = repo.record_recognition(timestamp=now, result="FAILURE", failure_reason="LOW_QUALITY")
+        db_session.commit()
+
+        assert (log_ok.expires_at.replace(tzinfo=timezone.utc) - now).days == LOG_SUCCESS_RETENTION_DAYS
+        assert (log_fail.expires_at.replace(tzinfo=timezone.utc) - now).days == LOG_FAILURE_RETENTION_DAYS
+        assert 30 <= LOG_SUCCESS_RETENTION_DAYS <= 90
+        assert 7 <= LOG_FAILURE_RETENTION_DAYS <= 30
+
+    def test_invalid_result_raises(self, db_session):
+        repo = self._repo(db_session)
+        with pytest.raises(ValueError, match="result không hợp lệ"):
+            repo.record_recognition(timestamp=datetime.now(timezone.utc), result="UNKNOWN_STATUS")
+
+    def test_delete_expired_removes_only_expired(self, db_session):
+        emp = self._emp(db_session, "LOG_EMP_03")
+        repo = self._repo(db_session)
+        old_ts = datetime.now(timezone.utc) - timedelta(days=40)
+        now_ts = datetime.now(timezone.utc)
+        old_log = repo.record_recognition(
+            timestamp=old_ts, result="FAILURE", failure_reason="UNKNOWN_FACE", retention_days=14
+        )
+        fresh_log = repo.record_recognition(
+            timestamp=now_ts, result="SUCCESS", employee_id=emp.id, retention_days=60
+        )
+        db_session.commit()
+        old_id, fresh_id = old_log.id, fresh_log.id
+
+        deleted = repo.delete_expired()
+        db_session.commit()
+        assert deleted == 1
+        assert repo.get_by_id(old_id) is None
+        assert repo.get_by_id(fresh_id) is not None
+
+    def test_list_by_employee_and_date(self, db_session):
+        from datetime import date as date_type
+        emp = self._emp(db_session, "LOG_EMP_04")
+        repo = self._repo(db_session)
+        ts = datetime(2026, 11, 26, 1, 0, 0, tzinfo=timezone.utc)  # 08:00:00 GMT+7
+        repo.record_recognition(timestamp=ts, result="SUCCESS", employee_id=emp.id, confidence=0.91)
+        db_session.commit()
+
+        by_emp = repo.list_by_employee(emp.id)
+        assert len(by_emp) == 1
+        by_day = repo.list_by_date(date_type(2026, 11, 26), tz_offset_hours=7)
+        assert any(item.employee_id == emp.id for item in by_day)
+
+
+# ===========================================================================
+# Tests: AttendanceRecordRepository — Giai đoạn 10
+# ===========================================================================
+
+class TestAttendanceRecordRepository:
+
+    def _emp(self, session, code="FA-IT-2026-0001"):
+        from app.database.repositories.employee_repo import EmployeeRepository
+        repo = EmployeeRepository(session)
+        emp = repo.create(code, f"Nhân viên {code}")
+        session.commit()
+        return emp
+
+    def _repo(self, session):
+        from app.database.repositories.attendance_record_repo import AttendanceRecordRepository
+        return AttendanceRecordRepository(session)
+
+    def test_upsert_check_in_creates_record(self, db_session):
+        emp = self._emp(db_session)
+        repo = self._repo(db_session)
+        # 2026-11-26 08:05:30 GMT+7 = 01:05:30 UTC
+        checkin_utc = datetime(2026, 11, 26, 1, 5, 30, tzinfo=timezone.utc)
+        rec = repo.upsert_check_in(
+            employee_id=emp.id,
+            check_in=checkin_utc,
+            confidence=0.94,
+            punctuality_status="LATE",
+            late_minutes=5,
+            device_id="CAM001",
+        )
+        db_session.commit()
+
+        assert rec.id is not None
+        assert rec.work_date.year == 2026
+        assert rec.work_date.month == 11
+        assert rec.work_date.day == 26
+        assert rec.attendance_status == "PRESENT"
+        assert rec.punctuality_status == "LATE"
+        assert rec.late_minutes == 5
+        assert rec.verify_method == "Face Recognition"
+        assert rec.verify_status == "Success"
+        assert rec.result == "Accepted"
+
+    def test_upsert_check_out_calculates_work_minutes(self, db_session):
+        emp = self._emp(db_session, "FA-IT-2026-0002")
+        repo = self._repo(db_session)
+        checkin_utc = datetime(2026, 11, 26, 1, 0, 15, tzinfo=timezone.utc)   # 08:00:15 GMT+7
+        checkout_utc = datetime(2026, 11, 26, 10, 5, 20, tzinfo=timezone.utc)  # 17:05:20 GMT+7
+
+        repo.upsert_check_in(emp.id, checkin_utc, punctuality_status="ON_TIME", late_minutes=0)
+        rec = repo.upsert_check_out(emp.id, checkout_utc, confidence=0.93)
+        db_session.commit()
+
+        assert rec is not None
+        assert rec.check_out is not None
+        assert rec.work_minutes == 9 * 60 + 5  # 545 phút
+
+    def test_to_display_dict_matches_business_format(self, db_session):
+        emp = self._emp(db_session, "FA-IT-2026-0003")
+        repo = self._repo(db_session)
+        checkin_utc = datetime(2026, 11, 26, 1, 5, 30, tzinfo=timezone.utc)  # 2026-11-26 08:05:30 GMT+7
+        rec = repo.upsert_check_in(
+            employee_id=emp.id,
+            check_in=checkin_utc,
+            device_id="CAM001",
+            punctuality_status="ON_TIME",
+            late_minutes=0,
+        )
+        db_session.commit()
+
+        d = rec.to_display_dict(tz_offset_hours=7)
+        assert d["Employee ID"] == "FA-IT-2026-0003"
+        assert d["Thời gian"] == "2026-11-26 08:05:30"
+        assert d["Device ID"] == "CAM001"
+        assert d["Phương thức"] == "Face Recognition"
+        assert d["Event Type"] == "Check-in"
+        assert d["Verify Status"] == "Success"
+        assert d["Result"] == "Accepted"
+        assert d["Record ID"] == rec.id
+
+    def test_query_by_year_month_day(self, db_session):
+        from datetime import date as date_type
+        emp = self._emp(db_session, "FA-IT-2026-0004")
+        repo = self._repo(db_session)
+
+        d1 = datetime(2026, 11, 26, 1, 0, 0, tzinfo=timezone.utc)
+        d2 = datetime(2026, 11, 27, 1, 15, 0, tzinfo=timezone.utc)
+        d3 = datetime(2026, 10, 5, 1, 0, 0, tzinfo=timezone.utc)
+
+        repo.upsert_check_in(emp.id, d1, punctuality_status="ON_TIME", late_minutes=0)
+        repo.upsert_check_in(emp.id, d2, punctuality_status="LATE", late_minutes=15)
+        repo.upsert_check_in(emp.id, d3, punctuality_status="ON_TIME", late_minutes=0)
+        db_session.commit()
+
+        assert len(repo.list_by_date(date_type(2026, 11, 26))) == 1
+        assert len(repo.list_by_month(2026, 11)) == 2
+        assert len(repo.list_by_year(2026)) == 3
+        assert repo.count_late_days(emp.id, year=2026, month=11) == 1
+        assert repo.count_present_days(emp.id, year=2026) == 3
+
+    def test_update_status(self, db_session):
+        emp = self._emp(db_session, "FA-IT-2026-0005")
+        repo = self._repo(db_session)
+        rec = repo.upsert_check_in(
+            emp.id, datetime(2026, 11, 26, 1, 20, 0, tzinfo=timezone.utc),
+            punctuality_status="LATE", late_minutes=20,
+        )
+        db_session.commit()
+        repo.update_status(rec.id, punctuality_status="ON_TIME", note="Xin phép đi muộn được duyệt")
+        db_session.commit()
+        updated = repo.get_by_id(rec.id)
+        assert updated.punctuality_status == "ON_TIME"
+        assert updated.record_source == "corrected"
+        assert updated.note == "Xin phép đi muộn được duyệt"
