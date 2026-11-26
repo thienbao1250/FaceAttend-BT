@@ -22,6 +22,7 @@ Thiết kế:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -233,20 +234,50 @@ class EnrollmentService:
     @staticmethod
     def generate_employee_id(prefix: str = "EMP") -> str:
         """
-        Tạo mã nhân viên duy nhất tự động.
+        Tạo mã nhân viên duy nhất tự động theo công thức chuyên nghiệp.
 
-        Định dạng: <PREFIX>-<YYYYMMDD>-<4 ký tự UUID ngẫu nhiên viết hoa>
-        Ví dụ:     EMP-20261123-A3F7
+        Định dạng: <PREFIX>-<YYYY>-<NNNN>
+        Trong đó:
+            PREFIX : mã công ty / tiền tố (mặc định "EMP"), VD: "FA", "NV", "CTYXX"
+            YYYY   : năm hiện tại 4 chữ số
+            NNNN   : số thứ tự 4 chữ số, tự động tăng và lưu vào
+                     data/employee_counter.json (bắt đầu từ 0001)
+
+        Ví dụ: FA-2026-0001, FA-2026-0002, ...
 
         Tham số:
-            prefix : tiền tố (mặc định "EMP"), có thể truyền "NV", "STAFF", v.v.
+            prefix : tiền tố mã công ty (mặc định "EMP"), có thể truyền "FA", "NV", v.v.
 
         Trả về:
             Chuỗi mã nhân viên duy nhất.
         """
-        date_part = time.strftime("%Y%m%d")
-        rand_part = uuid.uuid4().hex[:4].upper()
-        return f"{prefix.upper()}-{date_part}-{rand_part}"
+        year = time.strftime("%Y")
+        prefix = prefix.upper()
+
+        # Đường dẫn file lưu số thứ tự (tương đối so với project root)
+        counter_file = Path(__file__).resolve().parents[2] / "data" / "employee_counter.json"
+        counter_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Đọc counter hiện tại
+        counters: dict = {}
+        if counter_file.exists():
+            try:
+                counters = json.loads(counter_file.read_text(encoding="utf-8"))
+            except Exception:
+                counters = {}
+
+        # Key = "PREFIX-YEAR" để reset đúng theo năm
+        key = f"{prefix}-{year}"
+        seq = counters.get(key, 0) + 1
+        counters[key] = seq
+
+        # Ghi lại counter
+        counter_file.write_text(
+            json.dumps(counters, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        return f"{prefix}-{year}-{seq:04d}"
 
     def create_profile(
         self,

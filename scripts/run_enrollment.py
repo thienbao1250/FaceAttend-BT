@@ -22,6 +22,7 @@ Chạy: python scripts/run_enrollment.py
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# Đọc COMPANY_CODE từ biến môi trường (mặc định "FA")
+COMPANY_CODE = os.environ.get("COMPANY_CODE", "FA")
 
 from app.camera.camera_capture import CameraCapture
 from app.vision.face_detector import FaceDetector
@@ -115,8 +119,8 @@ def _input_employee_info() -> tuple[str, str, str]:
     print("  ĐĂNG KÝ NHÂN VIÊN MỚI")
     print("=" * 50)
     # Tự động tạo mã nhân viên
-    emp_id = EnrollmentService.generate_employee_id("NV")
-    print(f"  Mã nhân viên   : {emp_id}  (tự động tạo)")
+    emp_id = EnrollmentService.generate_employee_id(COMPANY_CODE)
+    print(f"  Mã nhân viên   : {emp_id}  (tự động tạo — {COMPANY_CODE}-YYYY-NNNN)")
     while True:
         name = input("  Họ tên             : ").strip()
         if name:
