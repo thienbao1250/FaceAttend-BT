@@ -54,6 +54,7 @@ from app.vision.face_alignment import align_face, crop_face_simple, ALIGNED_SIZE
 from app.vision.face_quality import FaceQualityChecker, QualityThresholds
 from app.vision.face_recognizer import FaceRecognizer
 from app.vision.face_matcher import FaceGallery, FaceMatcher, MatchStatus, MatchThresholds
+from app.vision.liveness import LivenessTracker, LivenessThresholds
 from app.attendance.attendance_service import (
     AttendanceService, EventType, PunctualityStatus, SkipReason, DEFAULT_TIMEZONE,
 )
@@ -198,6 +199,18 @@ class AttendanceTab(ttk.Frame):
         self._recent_events: list[str] = []
         self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        # Liveness: một tracker theo dõi xuyên suốt phiên camera
+        self._liveness = LivenessTracker(
+            thresholds=LivenessThresholds(
+                min_texture_score=60.0,
+                min_motion_score=0.35,
+                max_specular_ratio=0.08,
+                frames_required=8,
+                motion_frames_check=5,
+            ),
+            texture_pass_rate=0.6,
+        )
+        self._last_bbox: Optional[tuple] = None   # bbox frame trước để detect mất track
 
         self._build_ui()
 
@@ -347,6 +360,8 @@ class AttendanceTab(ttk.Frame):
             cooldown_seconds=self.COOLDOWN_SECONDS,
             min_toggle_seconds=self.MIN_TOGGLE_SECONDS,
         )
+        self._liveness.reset()
+        self._last_bbox = None
         self._thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._thread.start()
 
@@ -358,6 +373,8 @@ class AttendanceTab(ttk.Frame):
 
     def _reset(self) -> None:
         self._attendance.reset_state()
+        self._liveness.reset()
+        self._last_bbox = None
         self._status_var.set("↺ Đã reset cooldown/tracking")
 
     def _export(self) -> None:
@@ -387,8 +404,32 @@ class AttendanceTab(ttk.Frame):
 
                     best = FaceDetector.largest_face(detections)
                     match_result = None
+                    liveness_ok = False
+                    liveness_msg = ""
 
                     if best is not None:
+                        # --- Liveness detection (anti-spoofing) ---
+                        # Reset tracker nếu mất track khuôn mặt (bbox dịch quá xa)
+                        if self._last_bbox is not None:
+                            prev_cx = (self._last_bbox[0] + self._last_bbox[2]) / 2
+                            prev_cy = (self._last_bbox[1] + self._last_bbox[3]) / 2
+                            curr_cx = (best.bbox[0] + best.bbox[2]) / 2
+                            curr_cy = (best.bbox[1] + best.bbox[3]) / 2
+                            dist = ((curr_cx - prev_cx) ** 2 + (curr_cy - prev_cy) ** 2) ** 0.5
+                            face_diag = ((best.bbox[2] - best.bbox[0]) ** 2 +
+                                         (best.bbox[3] - best.bbox[1]) ** 2) ** 0.5
+                            if dist > face_diag * 0.6:  # Dịch > 60% đường chéo → người khác
+                                self._liveness.reset()
+                        self._last_bbox = best.bbox
+
+                        # Cập nhật liveness tracker mỗi frame
+                        try:
+                            self._liveness.update(frame, best.bbox)
+                        except Exception:
+                            pass
+
+                        liveness_ok, liveness_msg = self._liveness.is_live()
+
                         try:
                             if best.landmarks is not None:
                                 aligned_img = align_face(frame, best.landmarks).image
@@ -402,7 +443,8 @@ class AttendanceTab(ttk.Frame):
                                 landmarks=best.landmarks,
                             )
 
-                            if qr.passed:
+                            # Chỉ nhận diện khi liveness PASSED
+                            if qr.passed and liveness_ok:
                                 emb = self._engine.recognizer.get_embedding(aligned_img)
                                 match_result = self._engine.matcher.match(emb)
                         except Exception:
@@ -413,7 +455,15 @@ class AttendanceTab(ttk.Frame):
                         x1c = max(0, x1); y1c = max(0, y1)
                         x2c = min(cam_w - 1, x2); y2c = min(cam_h - 1, y2)
 
-                        if match_result is not None:
+                        # Màu box: cam khi đang xác thực liveness, bình thường khi đã OK
+                        if not liveness_ok:
+                            box_color = CV_ORANGE
+                            if x2c > x1c and y2c > y1c:
+                                cv2.rectangle(display, (x1c, y1c), (x2c, y2c), box_color, 2)
+                            # Hiển thị thông báo liveness bên dưới bbox
+                            _cv_put(display, liveness_msg[:55],
+                                    (x1c + 2, min(y2c + 18, cam_h - 6)), CV_ORANGE, 0.45, 1)
+                        elif match_result is not None:
                             box_color = _status_color(match_result.status)
                             if x2c > x1c and y2c > y1c:
                                 cv2.rectangle(display, (x1c, y1c), (x2c, y2c), box_color, 2)
@@ -449,12 +499,19 @@ class AttendanceTab(ttk.Frame):
                             box_color = CV_RED
                             if x2c > x1c and y2c > y1c:
                                 cv2.rectangle(display, (x1c, y1c), (x2c, y2c), box_color, 1)
+                    else:
+                        # Không tìm thấy khuôn mặt → reset liveness tracker
+                        self._liveness.reset()
+                        self._last_bbox = None
 
                     # HUD
+                    frames_txt = f"Live:{self._liveness.frame_count}"
                     _cv_put(display,
-                            f"Gallery: {self._engine.gallery.size} NV  |  SuKien: {self._attendance.total_events}",
+                            f"Gallery: {self._engine.gallery.size} NV  |  SuKien: {self._attendance.total_events}  |  {frames_txt}",
                             (10, 22), CV_CYAN, 0.5)
                     _cv_put(display, f"Faces: {len(detections)}", (10, 42), CV_WHITE, 0.42)
+                    if not liveness_ok and best is not None:
+                        _cv_put(display, "LIVENESS CHECK...", (10, 62), CV_ORANGE, 0.45)
 
                     # Cập nhật canvas
                     self._update_canvas(display)
