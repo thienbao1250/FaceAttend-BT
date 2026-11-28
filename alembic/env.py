@@ -41,18 +41,15 @@ import app.database.models  # noqa: F401, E402  — đảm bảo models được
 # ---------------------------------------------------------------------------
 config = context.config
 
-# Đặt DATABASE_URL từ env vào alembic config (ưu tiên env var)
-database_url = os.environ.get("DATABASE_URL", "")
-if database_url:
-    # Normalize postgres:// → postgresql+psycopg2://
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql+psycopg2://", 1)
-    config.set_main_option("sqlalchemy.url", database_url)
-else:
-    # Fallback SQLite — đồng bộ với connection.py
-    sqlite_path = ROOT / "data" / "faceattend.db"
-    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{sqlite_path}")
+# Đặt DATABASE_URL từ env vào alembic config (bắt buộc)
+database_url = os.environ.get("DATABASE_URL", "").strip()
+if not database_url:
+    raise RuntimeError(
+        "DATABASE_URL chưa được cấu hình trong .env hoặc biến môi trường."
+    )
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql+psycopg2://", 1)
+config.set_main_option("sqlalchemy.url", database_url)
 
 # ---------------------------------------------------------------------------
 # Logging

@@ -55,6 +55,14 @@ from app.vision.face_quality import FaceQualityChecker, QualityThresholds
 from app.vision.face_recognizer import FaceRecognizer
 from app.vision.face_matcher import FaceGallery, FaceMatcher, MatchStatus, MatchThresholds
 from app.vision.liveness import LivenessTracker, LivenessThresholds
+from app.database.db_sync import (
+    delete_employee_from_db,
+    generate_next_employee_code_from_db,
+    load_gallery_from_db,
+    log_recognition_to_db,
+    record_attendance_to_db,
+    save_enrolled_employee_to_db,
+)
 from app.attendance.attendance_service import (
     AttendanceService, EventType, PunctualityStatus, SkipReason, DEFAULT_TIMEZONE,
 )
@@ -69,9 +77,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DETECTOR_PATH   = ROOT / "models" / "det_10g.onnx"
 RECOGNIZER_PATH = ROOT / "models" / "w600k_r50.onnx"
-GALLERY_FILE    = ROOT / "data" / "gallery.npz"
 ATTENDANCE_DIR  = ROOT / "data" / "attendance"
-FACES_DIR       = ROOT / "data" / "registered_faces"
 
 COMPANY_CODE = os.environ.get("COMPANY_CODE", "FA")
 
@@ -150,8 +156,8 @@ class AIEngine:
             ))
 
             if progress_cb:
-                progress_cb("Đang nạp gallery nhân viên...")
-            self.gallery = FaceGallery.load(GALLERY_FILE)
+                progress_cb("Đang nạp gallery nhân viên từ PostgreSQL...")
+            self.gallery = load_gallery_from_db()
 
             thresholds = MatchThresholds(accept=0.35, reject=0.20, margin_min=0.07)
             self.matcher = FaceMatcher(self.gallery, thresholds)
@@ -169,8 +175,8 @@ class AIEngine:
             return False
 
     def reload_gallery(self) -> None:
-        """Nạp lại gallery sau khi đăng ký nhân viên mới."""
-        self.gallery = FaceGallery.load(GALLERY_FILE)
+        """Nạp lại gallery từ PostgreSQL sau khi đăng ký hoặc xóa nhân viên."""
+        self.gallery = load_gallery_from_db()
         if self.matcher:
             self.matcher.gallery = self.gallery
 
@@ -487,6 +493,16 @@ class AttendanceTab(ttk.Frame):
                             )
                             if decision.created:
                                 ev = decision.event
+                                try:
+                                    record_attendance_to_db(decision, camera_code=self.CAMERA_ID)
+                                    log_recognition_to_db(
+                                        result="SUCCESS",
+                                        employee_code=ev.employee_id,
+                                        camera_code=self.CAMERA_ID,
+                                        confidence=ev.similarity,
+                                    )
+                                except Exception as db_exc:
+                                    logger.error("Lỗi ghi chấm công vào PostgreSQL: %s", db_exc)
                                 icon = "CHECK-IN" if ev.event_type == EventType.CHECK_IN else "CHECK-OUT"
                                 punct = f" | {ev.punctuality_status.display_vi}"
                                 if ev.late_minutes:
@@ -738,9 +754,8 @@ class EnrollmentTab(ttk.Frame):
             messagebox.showwarning("Chưa sẵn sàng", "AI engine chưa tải xong.")
             return
 
-        # Tạo EnrollmentService mới cho mỗi phiên
+        # Tạo EnrollmentService mới cho mỗi phiên (chỉ lưu embedding vào PostgreSQL, không lưu ảnh thô)
         gallery = self._engine.gallery
-        from app.vision.face_matcher import FaceGallery as _FG
         self._service = EnrollmentService(
             detector=self._engine.detector,
             recognizer=self._engine.recognizer,
@@ -749,15 +764,13 @@ class EnrollmentTab(ttk.Frame):
             min_samples=MIN_SAMPLES_REQUIRED,
             max_samples=10,
             min_consistency=0.10,
-            save_images_dir=FACES_DIR,
+            save_images_dir=None,
         )
 
-        from app.enrollment.enrollment_service import EnrollmentService as _ES
-        emp_id = _ES.generate_employee_id(COMPANY_CODE)
-
         try:
+            emp_id = generate_next_employee_code_from_db(COMPANY_CODE)
             self._service.create_profile(emp_id, name, department=dept)
-        except ValueError as exc:
+        except Exception as exc:
             messagebox.showerror("Lỗi", str(exc))
             return
 
@@ -799,11 +812,18 @@ class EnrollmentTab(ttk.Frame):
             return
         final = self._service.finalize(self._current_emp_id)
         if final.success:
-            # Lưu tên vào gallery
             profile = self._service.get_profile(self._current_emp_id)
-            if profile:
-                self._engine.gallery.set_name(self._current_emp_id, profile.name)
-            self._engine.gallery.save(GALLERY_FILE)
+            embeddings = self._engine.gallery.get_embeddings(self._current_emp_id)
+            try:
+                save_enrolled_employee_to_db(
+                    employee_code=self._current_emp_id,
+                    full_name=profile.name if profile else self._current_emp_id,
+                    department=profile.department if profile else "",
+                    embeddings=embeddings,
+                )
+            except Exception as db_exc:
+                messagebox.showerror("Lỗi Database", f"Không thể lưu nhân viên vào PostgreSQL:\n{db_exc}")
+                return
             self._engine.reload_gallery()
             self._refresh_gallery()
             messagebox.showinfo("Thành công",
@@ -1001,8 +1021,11 @@ class GalleryTab(ttk.Frame):
         if not messagebox.askyesno("Xác nhận xóa",
                                     f"Xóa nhân viên:\n  {emp_id} — {name}\n\nHành động này không thể hoàn tác!"):
             return
-        self._engine.gallery.remove(emp_id)
-        self._engine.gallery.save(GALLERY_FILE)
+        try:
+            delete_employee_from_db(emp_id)
+        except Exception as db_exc:
+            messagebox.showerror("Lỗi Database", f"Không thể xóa nhân viên khỏi PostgreSQL:\n{db_exc}")
+            return
         self._engine.reload_gallery()
         self._refresh()
         messagebox.showinfo("Đã xóa", f"Đã xóa {emp_id} — {name} khỏi gallery.")

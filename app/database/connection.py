@@ -30,6 +30,16 @@ from typing import Generator
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+# Tự động nạp biến môi trường từ file .env nếu có python-dotenv
+try:
+    from dotenv import load_dotenv
+    _env_file = Path(__file__).resolve().parents[2] / ".env"
+    if _env_file.exists():
+        load_dotenv(_env_file, override=False)
+        logging.getLogger(__name__).debug("Đã nạp .env từ %s", _env_file)
+except ImportError:
+    pass  # python-dotenv chưa cài — dùng biến môi trường hệ thống bình thường
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,27 +58,19 @@ class Base(DeclarativeBase):
 
 def _get_database_url() -> str:
     """
-    Đọc DATABASE_URL từ biến môi trường.
-    Fallback về SQLite nếu không có (chỉ dev/test).
+    Đọc DATABASE_URL từ biến môi trường / file .env.
+    Bắt buộc phải cấu hình PostgreSQL (không dùng SQLite fallback).
     """
     url = os.environ.get("DATABASE_URL", "").strip()
-    if url:
-        # Hỗ trợ cả format postgres:// (Heroku cũ) và postgresql://
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-        logger.info("Database: PostgreSQL (từ DATABASE_URL)")
-        return url
-
-    # Fallback: SQLite
-    sqlite_path = Path(__file__).resolve().parent.parent.parent / "data" / "faceattend.db"
-    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-    fallback_url = f"sqlite:///{sqlite_path}"
-    logger.warning(
-        "DATABASE_URL không được set → dùng SQLite: %s\n"
-        "  Chỉ dùng SQLite cho dev/test. Đặt DATABASE_URL trong .env để dùng PostgreSQL.",
-        sqlite_path,
-    )
-    return fallback_url
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL chưa được cấu hình. "
+            "Vui lòng thiết lập DATABASE_URL trong file .env (PostgreSQL)."
+        )
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    logger.info("Database: PostgreSQL (từ DATABASE_URL)")
+    return url
 
 
 DATABASE_URL: str = _get_database_url()
